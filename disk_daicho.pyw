@@ -31,7 +31,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.2"
+APP_VERSION = "2026.11.21.3"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
 UPDATE_COMMIT_API = "https://api.github.com/repos/tatata17/Disk-Daicho/commits/main"
@@ -409,19 +409,27 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
                                              st.st_size, st.st_mtime, ext))
                                 if read_info:
                                     if ext == "csv" and st.st_size <= SIDECAR_MAX_BYTES:
-                                        csvs[stem.lower()] = e.path
+                                        csvs[stem.lower()] = (next_id, e.path)
                                     elif ext in VIDEO_EXTS:
                                         videos.append((next_id, stem.lower()))
                                 next_id += 1
                     except OSError:
                         n_skipped += 1
             if csvs:  # 動画と同名のcsvがあれば番組情報として読む
+                paired = set()
                 for vid, stem in videos:
                     if stem in csvs:
-                        info = parse_sidecar_csv(csvs[stem])
+                        csv_id, csv_path = csvs[stem]
+                        info = parse_sidecar_csv(csv_path)
                         if info:
                             prog_rows.append((vid, disk_id) + info)
                             n_info += 1
+                            paired.add(csv_id)
+                if paired:
+                    # 番組情報として動画に取り込んだcsvは、一覧には出さない(台帳に載せないだけで、
+                    # ディスク上のcsvには触れない。フォルダの合計サイズには含めたまま)。
+                    # 対の動画がないcsvや、番組情報ではないcsvは、普通のファイルとして載せる。
+                    rows[:] = [r for r in rows if r[0] not in paired]
             if len(rows) >= 5000:
                 cur.executemany("INSERT INTO entries VALUES(?,?,?,?,?,?,?,?)", rows)
                 rows.clear()
@@ -662,6 +670,7 @@ class App(tk.Tk):
         self.reload_drives()
         self.refresh_disks()
         self.after(100, self._poll)
+        self._hide_paired_csv_once()
         if self.get_setting("auto_update_check", "1") != "0":
             self.after(1500, lambda: self.check_for_update(manual=False))
 
@@ -673,6 +682,26 @@ class App(tk.Tk):
     def set_setting(self, key, value):
         with self.conn:
             self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+    def _hide_paired_csv_once(self):
+        """以前の版で記録したデータから、番組情報として取り込み済みのcsvの行を外す(初回だけ)。
+        台帳の記録を整理するだけで、ディスク上のファイルには触れない。"""
+        if self.get_setting("paired_csv_hidden") == "1":
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "DELETE FROM entries WHERE is_dir=0 AND ext='csv' AND EXISTS ("
+                    "SELECT 1 FROM programs p JOIN entries v ON v.id=p.entry_id "
+                    "WHERE v.disk_id=entries.disk_id AND v.parent_id=entries.parent_id "
+                    "AND lower(substr(v.name,1,length(v.name)-length(v.ext)-1))"
+                    "=lower(substr(entries.name,1,length(entries.name)-4)))")
+                self.conn.execute("UPDATE notes SET entry_id=NULL WHERE entry_id IS NOT NULL "
+                                  "AND entry_id NOT IN (SELECT id FROM entries)")
+                self.conn.execute("INSERT OR REPLACE INTO settings(key,value) "
+                                  "VALUES('paired_csv_hidden','1')")
+        except sqlite3.Error:
+            pass
 
     def _build_menu(self):
         bar = tk.Menu(self)
@@ -835,7 +864,7 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(top, text="中止", command=self.cancel.set, state="disabled")
         self.btn_stop.grid(row=1, column=7, padx=2)
         self.var_info_csv = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="動画と同名のcsv(m2ts-encoderの番組情報)も読み取る",
+        ttk.Checkbutton(top, text="動画と同名のcsv(m2ts-encoderの番組情報)を読み取る (読み取ったcsvは一覧に出しません)",
                         variable=self.var_info_csv).grid(row=2, column=0, columnspan=6,
                                                          sticky="w", pady=(6, 0))
         top.columnconfigure(0, weight=2)
