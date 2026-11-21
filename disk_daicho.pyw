@@ -33,7 +33,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.5"
+APP_VERSION = "2026.11.21.6"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -200,6 +200,81 @@ def fmt_time(t):
         return ""
 
 
+def fmt_serial(serial):
+    """ボリュームシリアル番号を Windows の表示形式(例: A3F2-9B1C)にする。無ければ空文字。表示専用"""
+    if not serial:
+        return ""
+    h = f"{int(serial) & 0xFFFFFFFF:08X}"
+    return f"{h[:4]}-{h[4:]}"
+
+
+def recorded_subpath(source, subpath):
+    """
+    フォルダ指定で記録したものの、ドライブ内のパスを「記録時のつづり」で返す(表示用)。
+    subpath は照合用に小文字にそろえてあるので、記録時のルート(source)からドライブ文字を除いた部分を使う。
+    今のドライブ文字は変わっていることがあるので、ドライブ文字は使わない。場所が食い違うときは subpath を返す。
+    """
+    sub = subpath or ""
+    if not sub:
+        return ""
+    tail = ntpath.splitdrive(source or "")[1].strip("\\/")
+    return tail if tail.lower() == sub else sub
+
+
+def disk_labels(rows):
+    """
+    左の一覧に出す文字列を作る。rows は [(名前, ロック中か, シリアル, subpath, source)]。
+    同じ名前の記録が2つ以上あるときだけ、見分け(シリアルと、フォルダ指定ならそのパス)を添える。
+    名前そのもの(DBの中身)は変えない。
+    """
+    count = {}
+    for name, *_rest in rows:
+        count[name] = count.get(name, 0) + 1
+    out = []
+    for name, locked, serial, subpath, source in rows:
+        text = name
+        if count[name] > 1:
+            marks = [x for x in (fmt_serial(serial), recorded_subpath(source, subpath)) if x]
+            if marks:
+                text += f" ({' / '.join(marks)})"
+        out.append(text + ("  (ロック中)" if locked else ""))
+    return out
+
+
+def name_clash_message(name, existing, current, others=0):
+    """
+    シリアル番号が一致しないのに、名前だけが既存の記録と同じときの確認文。
+    existing = (シリアル, 容量, 記録日時, 記録元)、current = (ルート, シリアル, ラベル, 容量)、
+    others = 同じ名前のほかの記録の数。
+    """
+    e_serial, e_total, e_at, e_source = existing
+    c_root, c_serial, c_label, c_total = current
+    if e_serial and c_serial:
+        verdict = "シリアル番号が違うため、別のディスクと思われます。"
+    else:
+        verdict = "シリアル番号が分からない記録があるため、同じディスクかどうかを確かめられません。"
+
+    def val(text):
+        return text if text else "(不明)"
+
+    msg = (f"「{name}」という名前は、既に記録されています。\n{verdict}\n\n"
+           "【既存の記録】\n"
+           f"　シリアル: {val(fmt_serial(e_serial))}\n"
+           f"　容量: {val(fmt_size(e_total) if e_total else '')}\n"
+           f"　記録日: {val(fmt_time(e_at))}\n"
+           f"　記録元: {val(e_source)}\n\n"
+           "【今回のディスク】\n"
+           f"　場所: {val(c_root)}\n"
+           f"　シリアル: {val(fmt_serial(c_serial))}\n"
+           f"　ラベル: {val(c_label)}\n"
+           f"　容量: {val(fmt_size(c_total) if c_total else '')}\n\n")
+    if others:
+        msg += f"※同じ名前の記録がほかに {others} 件あります。上の【既存の記録】は、いちばん新しいものです。\n\n"
+    msg += ("はい: 既存の記録を、今回のディスクの内容で上書きする\n"
+            "いいえ: 同じ名前のまま、別のディスクとして記録する (おすすめ)")
+    return msg
+
+
 def hash_password(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 100_000)
 
@@ -340,11 +415,7 @@ def connected_records(conn, drives, isdir=os.path.isdir):
         if root is None or (serial, sub) in seen:
             continue  # 同じ場所を別々に記録してあるときは、新しいほうだけ
         seen.add((serial, sub))
-        path = root
-        if sub:
-            # subpath は小文字にそろえてあるので、表示用に記録時のつづりを使う(同じ場所のときだけ)
-            tail = ntpath.splitdrive(source or "")[1].strip("\\/")
-            path = ntpath.join(root, tail if tail.lower() == sub else sub)
+        path = ntpath.join(root, recorded_subpath(source, sub)) if sub else root
         if isdir(path):
             out.append((order, did, name, path, rec_at))
     return [x[1:] for x in sorted(out, key=lambda x: (x[0] is None, x[0], x[1]))]
@@ -1343,12 +1414,21 @@ class App(tk.Tk):
             if ans:
                 replace_id = same[0]
         else:
-            row = self.conn.execute("SELECT id FROM disks WHERE name=?", (name,)).fetchone()
+            clash = self.conn.execute(
+                "SELECT id,serial,total,recorded_at,source FROM disks WHERE name=? "
+                "ORDER BY recorded_at DESC", (name,)).fetchall()
+            row = clash[0] if clash else None
         if row:
+            # 名前だけが同じ(シリアル番号は一致していない)。別のディスクの記録をうっかり上書きしないよう、
+            # 両方の情報を見せ、既定は「いいえ」(別に記録する)にする。Enterだけでは上書きにならない
+            try:
+                now_total = shutil.disk_usage(root).total
+            except OSError:
+                now_total = None
             ans = messagebox.askyesnocancel(
-                APP_NAME, f"「{name}」は既に記録されています。\n\n"
-                "別のディスクのようですが(または以前の版での記録)、どうしますか？\n"
-                "はい: 今の内容で上書き(更新)する\nいいえ: 同じ名前で別に記録する")
+                APP_NAME, name_clash_message(name, row[1:], (root, serial, _label, now_total),
+                                             others=len(clash) - 1),
+                default=messagebox.NO, icon="warning", parent=self)
             if ans is None:
                 return
             if ans:
@@ -1399,11 +1479,12 @@ class App(tk.Tk):
         if select_id is None:
             select_id = self.cur_disk
         rows = self.conn.execute(
-            "SELECT id,name,pw_hash IS NOT NULL FROM disks ORDER BY sort_order,id").fetchall()
+            "SELECT id,name,pw_hash IS NOT NULL,serial,subpath,source FROM disks "
+            "ORDER BY sort_order,id").fetchall()
         self.disk_ids = [r[0] for r in rows]
         self.lst.delete(0, "end")
-        for _id, name, locked in rows:
-            self.lst.insert("end", name + ("  (ロック中)" if locked else ""))
+        for text in disk_labels([r[1:] for r in rows]):  # 同名のときだけ見分けを添える(名前は変えない)
+            self.lst.insert("end", text)
         if select_id in self.disk_ids:
             i = self.disk_ids.index(select_id)
         elif self.disk_ids:
@@ -1431,7 +1512,7 @@ class App(tk.Tk):
     def disk_row(self, disk_id):
         return self.conn.execute(
             "SELECT name,source,label,total,free,recorded_at,folders_only,max_depth,"
-            "pw_hash IS NOT NULL,n_files,n_dirs,used FROM disks WHERE id=?", (disk_id,)).fetchone()
+            "pw_hash IS NOT NULL,n_files,n_dirs,used,serial FROM disks WHERE id=?", (disk_id,)).fetchone()
 
     def is_locked(self, disk_id):
         r = self.conn.execute("SELECT pw_hash IS NOT NULL FROM disks WHERE id=?", (disk_id,)).fetchone()
@@ -1450,6 +1531,8 @@ class App(tk.Tk):
                 f"合計 {fmt_size(r[11])}"]
         if r[3]:
             info.append(f"容量 {fmt_size(r[3])} (空き {fmt_size(r[4])})")
+        if r[12]:
+            info.append(f"シリアル {fmt_serial(r[12])}")
         info.append(f"記録元 {r[1]}")
         if r[6]:
             info.append("フォルダのみ記録")

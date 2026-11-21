@@ -195,9 +195,53 @@ def test_diff():
     conn.close()
 
 
+def test_same_name_labels():
+    check("シリアルの表示形式", app.fmt_serial(0xA3F29B1C), "A3F2-9B1C")
+    check("先頭のゼロを落とさない", app.fmt_serial(0x00012ABC), "0001-2ABC")
+    check("None は空文字", app.fmt_serial(None), "")
+    check("0 は空文字", app.fmt_serial(0), "")
+
+    check("記録時のつづりで出す", app.recorded_subpath("E:\\Rec\\Anime", "rec\\anime"), "Rec\\Anime")
+    check("ドライブ直下の記録は空", app.recorded_subpath("E:\\", ""), "")
+    check("食い違うときは保存値", app.recorded_subpath("E:\\Other", "rec\\anime"), "rec\\anime")
+
+    rows = [  # 名前, ロック中, シリアル, subpath, source
+        ("動画保管01", 0, 0xA3F29B1C, "", "E:\\"),
+        ("音楽HDD", 1, 0x11112222, "", "F:\\"),
+        ("作業用", 0, 0xA3F29B1C, "rec\\anime", "E:\\Rec\\Anime"),
+    ]
+    check("重複が無ければ従来どおり", app.disk_labels(rows), ["動画保管01", "音楽HDD  (ロック中)", "作業用"])
+    rows += [
+        ("動画保管01", 1, 0x5555AAAA, "", "G:\\"),                    # 別のディスクが同名
+        ("作業用", 0, 0xA3F29B1C, "rec\\drama", "E:\\Rec\\Drama"),      # 同じボリュームの別フォルダが同名
+        ("旧記録", 0, None, "", "H:\\"), ("旧記録", 0, None, "old\\x", "H:\\Old\\X"),
+    ]
+    check("同名のときだけ見分けを添える", app.disk_labels(rows), [
+        "動画保管01 (A3F2-9B1C)", "音楽HDD  (ロック中)", "作業用 (A3F2-9B1C / Rec\\Anime)",
+        "動画保管01 (5555-AAAA)  (ロック中)", "作業用 (A3F2-9B1C / Rec\\Drama)",
+        "旧記録", "旧記録 (Old\\X)"])
+    check("片方を消すと添え表示も消える", app.disk_labels(rows[1:3] + rows[3:4]),
+          ["音楽HDD  (ロック中)", "作業用", "動画保管01  (ロック中)"])
+
+
+def test_name_clash_message():
+    msg = app.name_clash_message("動画保管01", (0xA3F29B1C, 2 * 1024 ** 4, 0, "E:\\"),
+                                 ("G:\\", 0x5555AAAA, "NEWHDD", 4 * 1024 ** 4), others=0)
+    for part in ("シリアル番号が違うため、別のディスクと思われます。",
+                 "【既存の記録】", "シリアル: A3F2-9B1C", "容量: 2.00 TB", "記録元: E:\\",
+                 "【今回のディスク】", "場所: G:\\", "シリアル: 5555-AAAA", "ラベル: NEWHDD", "容量: 4.00 TB",
+                 "いいえ: 同じ名前のまま、別のディスクとして記録する"):
+        check(f"確認文に「{part}」がある", part in msg, True)
+    check("ほかの同名が無ければ注記なし", "ほかに" in msg, False)
+    old = app.name_clash_message("X", (None, None, None, ""), ("G:\\", 1, "", None), others=2)
+    check("シリアル不明の旧記録では言い切らない", "確かめられません" in old and "別のディスクと思われます" not in old, True)
+    check("ほかの同名の件数を知らせる", "ほかに 2 件" in old, True)
+
+
 def main():
     try:
-        for fn in (test_settings, test_summary, test_info_csv_inherit, test_connected_records, test_diff):
+        for fn in (test_settings, test_summary, test_info_csv_inherit, test_connected_records, test_diff,
+                   test_same_name_labels, test_name_clash_message):
             fn()
             print(f"OK  {fn.__name__}")
     finally:
