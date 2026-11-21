@@ -7,6 +7,7 @@
 ・m2ts-encoder が動画と同名で出力する番組情報csv(rplsinfoの出力)も読み取り、
   番組名・放送日・チャンネル・番組内容を一緒に記録して検索できる
 ・ファイルやフォルダごとにメモを書ける (名前を付け直していないisoなどに「これは何のファイルか」を残せる)
+・「ヘルプ → アップデートを確認」で、GitHubの最新版に更新できる(今の版は自動でバックアップ)
 ・専用のアイコン付き。タスクバーでも他のpywとは別のアイコンとして並ぶ
 ・標準ライブラリのみで動作 (Python 3.8 以降 / Windows 想定)
 ・記録データはこのファイルと同じフォルダの disk_daicho.db (SQLite) に保存
@@ -14,18 +15,28 @@
 import csv
 import hashlib
 import io
+import json
 import os
 import queue
+import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
+APP_VERSION = "2026.11.21.1"
+UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
+UPDATE_INFO_FILE = "version.json"
+UPDATE_COMMIT_API = "https://api.github.com/repos/tatata17/Disk-Daicho/commits/main"
+UPDATE_BACKUP_KEEP = 5
+UPDATE_MIN_SIZE = 30_000   # これより小さいファイルは「壊れている」として受け付けない
 PAGE_SIZE = 1000
 IS_WIN = sys.platform.startswith("win")
 
@@ -65,6 +76,101 @@ def db_path():
         base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "disk_daicho")
         os.makedirs(base, exist_ok=True)
     return os.path.join(base, "disk_daicho.db")
+
+
+# ---------------------------------------------------------------- アップデート
+def parse_version(text):
+    """「2026.11.21.1」のような版番号を比較用のタプルにする。読めなければ空タプル"""
+    try:
+        return tuple(int(x) for x in str(text).strip().split("."))
+    except ValueError:
+        return ()
+
+
+def _http_get(url, timeout=15.0):
+    req = urllib.request.Request(url, headers={"User-Agent": "disk-daicho-updater",
+                                               "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def resolve_update_base():
+    """
+    取得元のURLの先頭を決める。mainの最新コミットのIDを調べて、そのコミットに固定したURLにする
+    (公開した直後に、配信側のキャッシュで version.json と本体の版が食い違うのを避ける)。
+    調べられなければ main をそのまま使う。
+    """
+    try:
+        sha = str(json.loads(_http_get(UPDATE_COMMIT_API, timeout=8.0).decode("utf-8")).get("sha", ""))
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            return UPDATE_BASE_URL.replace("/main/", f"/{sha}/")
+    except Exception:  # noqa: BLE001
+        pass
+    return UPDATE_BASE_URL
+
+
+def fetch_update_info():
+    """GitHub上の version.json を取得する。失敗したら例外"""
+    base = resolve_update_base()
+    raw = _http_get(base + UPDATE_INFO_FILE + f"?t={int(time.time())}")
+    info = json.loads(raw.decode("utf-8"))
+    if not isinstance(info, dict) or not parse_version(info.get("version", "")) or not info.get("file"):
+        raise ValueError("version.json の形式が正しくありません")
+    info["_base"] = base  # 本体も同じコミットから取る
+    return info
+
+
+def is_newer_version(remote, local=None):
+    r, l = parse_version(remote), parse_version(APP_VERSION if local is None else local)
+    return bool(r) and r > l
+
+
+def download_update_source(info):
+    """新しい版のファイルを取得し、壊れていないか確認してから返す(確認に通らなければ例外)。改行はLFにそろえる"""
+    base = str(info.get("_base") or UPDATE_BASE_URL)
+    raw = _http_get(base + str(info["file"]) + f"?t={int(time.time())}", timeout=60.0)
+    raw = raw.replace(b"\r\n", b"\n")  # SHA-256 はこの形で計算する(tools/release.py と同じ)
+    expected = str(info.get("sha256") or "").strip().lower()
+    if expected and hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError(
+            "ダウンロードしたファイルが、配布元の記録(SHA-256)と一致しません。\n"
+            "公開直後なら、数分待つと直ります。しばらく待っても同じときは、"
+            "配布ページから新しいファイルを入れ直してください")
+    text = raw.decode("utf-8")
+    if len(raw) < UPDATE_MIN_SIZE:
+        raise ValueError("ダウンロードしたファイルが小さすぎます(壊れている可能性があります)")
+    m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not m or m.group(1) != str(info["version"]):
+        raise ValueError("ダウンロードしたファイルの版番号が version.json と一致しません"
+                         "(少し待ってからやり直してください)")
+    compile(text, "disk_daicho_update", "exec")  # 構文エラーがないか確認
+    return raw
+
+
+def update_backup_dir():
+    return os.path.join(os.path.dirname(db_path()), "backup")
+
+
+def install_update(raw):
+    """今のスクリプトをバックアップしてから、新しい版に置き換える。バックアップのパスを返す"""
+    script = os.path.abspath(__file__)
+    backup_dir = update_backup_dir()
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = os.path.join(backup_dir, f"disk_daicho_{APP_VERSION}_{stamp}.pyw")
+    shutil.copy2(script, backup_path)
+    tmp = script + ".new"
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    os.replace(tmp, script)
+    old = sorted(n for n in os.listdir(backup_dir)
+                 if re.fullmatch(r"disk_daicho_.+_\d{8}-\d{6}\.pyw", n))
+    for n in old[:-UPDATE_BACKUP_KEEP]:  # 古いバックアップは UPDATE_BACKUP_KEEP 本を残して消す
+        try:
+            os.remove(os.path.join(backup_dir, n))
+        except OSError:
+            pass
+    return backup_path
 
 
 def fmt_size(n):
@@ -211,6 +317,7 @@ CREATE TABLE IF NOT EXISTS programs(
     entry_id INTEGER PRIMARY KEY, disk_id INTEGER NOT NULL, title TEXT, bdate TEXT,
     btime TEXT, channel TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS idx_programs_disk ON programs(disk_id);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS notes(
     id INTEGER PRIMARY KEY, disk_id INTEGER NOT NULL, path TEXT NOT NULL,
     entry_id INTEGER, note TEXT);
@@ -525,7 +632,7 @@ def set_window_taskbar_identity(tk_window) -> str:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         try:
             self._app_icon = tk.PhotoImage(data=APP_ICON_PNG_B64)
             self.iconphoto(True, self._app_icon)  # True: 入力ダイアログなどにも同じアイコン
@@ -555,9 +662,136 @@ class App(tk.Tk):
         self.reload_drives()
         self.refresh_disks()
         self.after(100, self._poll)
+        if self.get_setting("auto_update_check", "1") != "0":
+            self.after(1500, lambda: self.check_for_update(manual=False))
+
+    # ---------------- 設定・アップデート
+    def get_setting(self, key, default=""):
+        r = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def set_setting(self, key, value):
+        with self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+    def _build_menu(self):
+        bar = tk.Menu(self)
+        self._help_menu = tk.Menu(bar, tearoff=0)
+        self._help_menu.add_command(label="アップデートを確認...",
+                                    command=lambda: self.check_for_update(manual=True))
+        self.auto_update_var = tk.BooleanVar(value=self.get_setting("auto_update_check", "1") != "0")
+        self._help_menu.add_checkbutton(
+            label="起動時に更新を確認する", variable=self.auto_update_var,
+            command=lambda: self.set_setting("auto_update_check",
+                                             "1" if self.auto_update_var.get() else "0"))
+        self._help_menu.add_separator()
+        self._help_menu.add_command(label="バージョン情報", command=lambda: messagebox.showinfo(
+            "バージョン情報", f"{APP_NAME}\nバージョン {APP_VERSION}\n\n"
+            "配布元: https://github.com/tatata17/Disk-Daicho", parent=self))
+        bar.add_cascade(label="ヘルプ", menu=self._help_menu)
+        self.configure(menu=bar)
+
+    def check_for_update(self, manual=False):
+        """バックグラウンドで更新を確認する。manual=True は結果を必ずダイアログで知らせる"""
+        if getattr(self, "_update_checking", False):
+            return
+        self._update_checking = True
+        result = queue.Queue()
+
+        def worker():
+            try:
+                result.put(("ok", fetch_update_info()))
+            except Exception as e:  # noqa: BLE001
+                result.put(("err", e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                kind, value = result.get_nowait()
+            except queue.Empty:
+                self.after(300, poll)
+                return
+            self._update_checking = False
+            if kind == "err":
+                if manual:
+                    messagebox.showerror("アップデート", "更新の確認に失敗しました。\n"
+                                         f"ネットワークに接続できているか確認してください。\n\n{value}",
+                                         parent=self)
+                return
+            if not is_newer_version(str(value["version"])):
+                if manual:
+                    messagebox.showinfo("アップデート", f"最新の版です。(バージョン {APP_VERSION})",
+                                        parent=self)
+                return
+            self._help_menu.entryconfig(
+                0, label=f"アップデートを確認... (新しい版 {value['version']} があります)")
+            if self.scanning and not manual:  # 記録中は邪魔しない(メニューの表示だけ)
+                return
+            self._confirm_and_update(value)
+
+        self.after(300, poll)
+
+    def _confirm_and_update(self, info):
+        if self.scanning:
+            messagebox.showinfo("アップデート", "記録中は更新できません。終わってからやり直してください。",
+                                parent=self)
+            return
+        notes = str(info.get("notes", "")).strip() or \
+            "(細かい修正です。詳しくは、更新履歴(GitHubの CHANGELOG.md)を見てください)"
+        if not messagebox.askyesno(
+                "アップデート", f"新しい版があります。\n\n現在: {APP_VERSION}\n最新: {info['version']}\n\n"
+                f"【更新内容】\n{notes}\n\n更新して、アプリを再起動しますか?\n"
+                "(今の版は自動でバックアップします。記録データはそのまま残ります)", parent=self):
+            return
+        self.var_status.set("アップデートをダウンロード中...")
+        result = queue.Queue()
+
+        def worker():
+            try:
+                result.put(("ok", download_update_source(info)))
+            except Exception as e:  # noqa: BLE001
+                result.put(("err", e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                kind, value = result.get_nowait()
+            except queue.Empty:
+                self.after(300, poll)
+                return
+            if kind == "err":
+                self.var_status.set("アップデートに失敗しました。")
+                messagebox.showerror("アップデート", "ダウンロードに失敗しました。今の版はそのままです。"
+                                     f"\n\n{value}", parent=self)
+                return
+            if self.scanning:
+                messagebox.showinfo("アップデート", "記録が始まったため、更新を中止しました。", parent=self)
+                return
+            try:
+                backup_path = install_update(value)
+            except Exception as e:  # noqa: BLE001
+                self.var_status.set("アップデートに失敗しました。")
+                messagebox.showerror("アップデート", "置き換えに失敗しました。今の版はそのままです。"
+                                     f"\n\n{e}", parent=self)
+                return
+            messagebox.showinfo("アップデート", f"バージョン {info['version']} に更新しました。再起動します。"
+                                f"\n\n(旧版のバックアップ: {backup_path})", parent=self)
+            script = os.path.abspath(__file__)
+            try:
+                subprocess.Popen([sys.executable, script], cwd=os.path.dirname(script))
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("アップデート", "自動で再起動できませんでした。"
+                                     f"手動で起動し直してください。\n\n{e}", parent=self)
+                return
+            self.destroy()
+
+        self.after(300, poll)
 
     # ---------------- 画面構築
     def _build(self):
+        self._build_menu()
         st = ttk.Style(self)
         try:
             st.theme_use("vista" if IS_WIN else "clam")

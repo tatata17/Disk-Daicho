@@ -1,2 +1,4 @@
 disk_daicho.db*
 __pycache__/
+backup/
+*.pyw.new
