@@ -33,7 +33,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.7"
+APP_VERSION = "2026.11.21.8"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -223,7 +223,7 @@ def recorded_subpath(source, subpath):
 
 def disk_labels(rows):
     """
-    左の一覧に出す文字列を作る。rows は [(名前, ロック中か, シリアル, subpath, source)]。
+    左の一覧に出す文字列を作る。rows は [(名前, シリアル, subpath, source)]。
     同じ名前の記録が2つ以上あるときだけ、見分け(シリアルと、フォルダ指定ならそのパス)を添える。
     名前そのもの(DBの中身)は変えない。
     """
@@ -231,13 +231,13 @@ def disk_labels(rows):
     for name, *_rest in rows:
         count[name] = count.get(name, 0) + 1
     out = []
-    for name, locked, serial, subpath, source in rows:
+    for name, serial, subpath, source in rows:
         text = name
         if count[name] > 1:
             marks = [x for x in (fmt_serial(serial), recorded_subpath(source, subpath)) if x]
             if marks:
                 text += f" ({' / '.join(marks)})"
-        out.append(text + ("  (ロック中)" if locked else ""))
+        out.append(text)
     return out
 
 
@@ -273,10 +273,6 @@ def name_clash_message(name, existing, current, others=0):
     msg += ("はい: 既存の記録を、今回のディスクの内容で上書きする\n"
             "いいえ: 同じ名前のまま、別のディスクとして記録する (おすすめ)")
     return msg
-
-
-def hash_password(pw, salt):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 100_000)
 
 
 def list_drives():
@@ -654,12 +650,11 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
                         ((s, i) for i, s in dir_size.items() if i))
         cur.execute("UPDATE disks SET n_files=?,n_dirs=?,used=?,n_skipped=? WHERE id=?",
                     (n_files, n_dirs, dir_size[0], n_skipped, disk_id))
-        if replace_id:  # 上書き: 並び順とパスワードを引き継いで古い記録を消す
-            old = cur.execute("SELECT sort_order,pw_salt,pw_hash FROM disks WHERE id=?",
+        if replace_id:  # 上書き: 並び順を引き継いで古い記録を消す
+            old = cur.execute("SELECT sort_order FROM disks WHERE id=?",
                               (replace_id,)).fetchone()
             if old:
-                cur.execute("UPDATE disks SET sort_order=?,pw_salt=?,pw_hash=? WHERE id=?",
-                            (old[0], old[1], old[2], disk_id))
+                cur.execute("UPDATE disks SET sort_order=? WHERE id=?", (old[0], disk_id))
                 # 差分: 古い記録を消す前に、古い側と新しい側のパスを突き合わせる(その場で計算して捨てる)
                 prev = cur.execute("SELECT folders_only,used FROM disks WHERE id=?",
                                    (replace_id,)).fetchone()
@@ -874,7 +869,6 @@ class App(tk.Tk):
         self.cur_disk = None
         self.cur_folder = 0
         self.history = []
-        self.unlocked = set()
         self.search_mode = False
         self.page = 0
         self.sort_col, self.sort_desc = "name", False
@@ -888,6 +882,7 @@ class App(tk.Tk):
         self.after(100, self._poll)
         self._hide_paired_csv_once()
         self.after(200, self._initial_focus)
+        self.after(600, self._password_removed_notice)
         if self.get_setting("auto_update_check", "1") != "0":
             self.after(1500, lambda: self.check_for_update(manual=False))
 
@@ -899,6 +894,22 @@ class App(tk.Tk):
     def set_setting(self, key, value):
         with self.conn:
             self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+    def _password_removed_notice(self):
+        """パスワード(表示ロック)の機能をなくした。以前の版でロックしていた記録があれば、一度だけ知らせる"""
+        try:
+            n = self.conn.execute("SELECT COUNT(*) FROM disks WHERE pw_hash IS NOT NULL").fetchone()[0]
+            if not n:
+                return
+            with self.conn:
+                self.conn.execute("UPDATE disks SET pw_salt=NULL,pw_hash=NULL")
+        except sqlite3.Error:
+            return
+        messagebox.showinfo(
+            APP_NAME, "パスワード(表示ロック)の機能は、この版からなくなりました。\n\n"
+            f"ロックしていた {n} 件の記録は、パスワードなしで表示・検索されるようになります。\n"
+            "(画面上で見えなくするだけの仕組みで、記録データそのものは守れていなかったためです)",
+            parent=self)
 
     def _hide_paired_csv_once(self):
         """以前の版で記録したデータから、番組情報として取り込み済みのcsvの行を外す(初回だけ)。
@@ -1075,7 +1086,6 @@ class App(tk.Tk):
         ttk.Button(row, text="解除", command=self.clear_search).pack(side="left")
         tk.Label(band, bg=ACCENT, fg=ACCENT_SOFT, anchor="w", font=("", 9),
                  text="ファイル名のほか、メモ・番組名・チャンネル・番組内容にもヒットします(Enterで検索)。"
-                      "ロック中のディスクは「すべてのディスク」の検索では対象外です。"
                  ).pack(fill="x", padx=10, pady=(0, 6))
 
         # ---- 記録済みのディスクが接続されているときのバナー(無いときは高さ1で見えない)
@@ -1180,8 +1190,7 @@ class App(tk.Tk):
         self.var_title = tk.StringVar(value="(ディスク未選択)")
         ttk.Label(r1, textvariable=self.var_title, style="Title.TLabel").pack(side="left")
         ttk.Button(r1, text="記録を削除", command=self.delete_disk).pack(side="right")
-        ttk.Button(r1, text="パスワード", command=self.set_password).pack(side="right", padx=4)
-        ttk.Button(r1, text="名前変更", command=self.rename_disk).pack(side="right")
+        ttk.Button(r1, text="名前変更", command=self.rename_disk).pack(side="right", padx=4)
         self.var_info = tk.StringVar()
         ttk.Label(right, textvariable=self.var_info, foreground="#555").pack(fill="x", pady=(2, 6))
 
@@ -1225,11 +1234,6 @@ class App(tk.Tk):
         self.menu.add_command(label="このフォルダの場所へ移動", command=self.jump_to_location)
         self.menu.add_separator()
         self.menu.add_command(label="メモを書く…", command=self.edit_note)
-
-        self.lock_frame = ttk.Frame(tf)
-        ttk.Label(self.lock_frame, text="このディスクの記録はロックされています。\n"
-                  "パスワードを入力すると内容を表示できます。", justify="center").pack(pady=10)
-        ttk.Button(self.lock_frame, text="パスワードを入力", command=self.unlock).pack()
 
         r5 = ttk.Frame(right)
         r5.pack(side="bottom", fill="x", pady=(6, 0))
@@ -1485,7 +1489,7 @@ class App(tk.Tk):
         if select_id is None:
             select_id = self.cur_disk
         rows = self.conn.execute(
-            "SELECT id,name,pw_hash IS NOT NULL,serial,subpath,source FROM disks "
+            "SELECT id,name,serial,subpath,source FROM disks "
             "ORDER BY sort_order,id").fetchall()
         self.disk_ids = [r[0] for r in rows]
         self.lst.delete(0, "end")
@@ -1503,7 +1507,6 @@ class App(tk.Tk):
             self.var_info.set("")
             self.var_path.set("")
             self._fill([])
-            self.lock_frame.place_forget()
         else:
             self.lst.selection_clear(0, "end")
             self.lst.selection_set(i)
@@ -1518,11 +1521,7 @@ class App(tk.Tk):
     def disk_row(self, disk_id):
         return self.conn.execute(
             "SELECT name,source,label,total,free,recorded_at,folders_only,max_depth,"
-            "pw_hash IS NOT NULL,n_files,n_dirs,used,serial FROM disks WHERE id=?", (disk_id,)).fetchone()
-
-    def is_locked(self, disk_id):
-        r = self.conn.execute("SELECT pw_hash IS NOT NULL FROM disks WHERE id=?", (disk_id,)).fetchone()
-        return bool(r and r[0]) and disk_id not in self.unlocked
+            "0,n_files,n_dirs,used,serial FROM disks WHERE id=?", (disk_id,)).fetchone()
 
     def open_disk(self, disk_id, folder=0):
         r = self.disk_row(disk_id)
@@ -1575,8 +1574,6 @@ class App(tk.Tk):
     def delete_disk(self):
         if self.cur_disk is None:
             return
-        if self.is_locked(self.cur_disk) and not self.unlock():
-            return
         name = self.disk_row(self.cur_disk)[0]
         if not messagebox.askyesno(APP_NAME, f"「{name}」の記録を削除しますか？\n"
                                    "(ディスク本体の中身には一切触れません)", icon="warning"):
@@ -1592,55 +1589,6 @@ class App(tk.Tk):
         self.refresh_disks()
         self.reload_drives()
         self.var_status.set(f"「{name}」の記録を削除しました。")
-
-    # ---------------- パスワード (表示ロック)
-    def _check_pw(self, disk_id, pw):
-        salt, h = self.conn.execute("SELECT pw_salt,pw_hash FROM disks WHERE id=?", (disk_id,)).fetchone()
-        return h is not None and hash_password(pw, salt) == h
-
-    def unlock(self):
-        if self.cur_disk is None:
-            return False
-        pw = simpledialog.askstring(APP_NAME, "パスワード:", show="●", parent=self)
-        if pw is None:
-            return False
-        if not self._check_pw(self.cur_disk, pw):
-            messagebox.showerror(APP_NAME, "パスワードが違います。")
-            return False
-        self.unlocked.add(self.cur_disk)
-        self.show()
-        return True
-
-    def set_password(self):
-        if self.cur_disk is None:
-            return
-        has_pw = self.disk_row(self.cur_disk)[8]
-        if has_pw:
-            if self.is_locked(self.cur_disk) and not self.unlock():
-                return
-            if messagebox.askyesno(APP_NAME, "このディスクのパスワードを解除しますか？\n"
-                                   "(「いいえ」で新しいパスワードに変更)"):
-                with self.conn:
-                    self.conn.execute("UPDATE disks SET pw_salt=NULL,pw_hash=NULL WHERE id=?",
-                                      (self.cur_disk,))
-                self.unlocked.discard(self.cur_disk)
-                self.refresh_disks()
-                return
-        pw = simpledialog.askstring(
-            APP_NAME, "設定するパスワード:\n\n※このソフト上で中身を見えなくする簡易ロックです。\n"
-            "　記録データ自体は暗号化されません。", show="●", parent=self)
-        if not pw:
-            return
-        if simpledialog.askstring(APP_NAME, "確認のためもう一度:", show="●", parent=self) != pw:
-            messagebox.showerror(APP_NAME, "パスワードが一致しません。")
-            return
-        salt = os.urandom(16)
-        with self.conn:
-            self.conn.execute("UPDATE disks SET pw_salt=?,pw_hash=? WHERE id=?",
-                              (salt, hash_password(pw, salt), self.cur_disk))
-        self.unlocked.add(self.cur_disk)  # 設定した本人はこの起動中は見える
-        self.refresh_disks()
-        self.var_status.set("パスワードを設定しました。次回起動時からロックされます。")
 
     # ---------------- 表示
     def path_of(self, entry_id):
@@ -1672,13 +1620,6 @@ class App(tk.Tk):
             return
         if self.cur_disk is None:
             return
-        if self.is_locked(self.cur_disk):
-            self._fill([])
-            self.var_path.set("")
-            self.var_count.set("")
-            self.lock_frame.place(relx=0.5, rely=0.45, anchor="center")
-            return
-        self.lock_frame.place_forget()
         rows = self.conn.execute(
             f"{SELECT_ROWS} WHERE e.disk_id=? AND e.parent_id=? {self._order_sql()} LIMIT ? OFFSET ?",
             (self.cur_disk, self.cur_folder, PAGE_SIZE + 1, self.page * PAGE_SIZE)).fetchall()
@@ -1898,14 +1839,7 @@ class App(tk.Tk):
         words = self.var_q.get().split()
         tfilter = TYPE_FILTERS[self.cmb_type.get()]
         where, args = [], []
-        if self.cmb_where.current() == 0:
-            if self.is_locked(self.cur_disk):
-                messagebox.showinfo(APP_NAME, "このディスクはロックされています。")
-                self.search_mode = False
-                return
-            targets = [self.cur_disk]
-        else:
-            targets = [d for d in self.disk_ids if not self.is_locked(d)]
+        targets = [self.cur_disk] if self.cmb_where.current() == 0 else list(self.disk_ids)
         if not targets:
             self._fill([])
             return
@@ -1925,12 +1859,8 @@ class App(tk.Tk):
         rows = self.conn.execute(
             f"{SELECT_ROWS} WHERE {' AND '.join(where)} {self._order_sql()} LIMIT ? OFFSET ?",
             args + [PAGE_SIZE + 1, self.page * PAGE_SIZE]).fetchall()
-        self.lock_frame.place_forget()
         self.var_path.set(f"検索結果: {self.var_q.get().strip()}  [{self.cmb_where.get()} / {self.cmb_type.get()}]")
         self._fill(rows, show_loc=True)
-        locked = len(self.disk_ids) - len(targets) if self.cmb_where.current() == 1 else 0
-        if locked:
-            self.var_count.set(self.var_count.get() + f"   ※ロック中の {locked} 台は検索対象外")
 
     def clear_search(self):
         self.var_q.set("")
@@ -1970,12 +1900,10 @@ class App(tk.Tk):
     # ---------------- 書き出し
     def export_csv(self, all_disks):
         if all_disks:
-            targets = [d for d in self.disk_ids if not self.is_locked(d)]
+            targets = list(self.disk_ids)
             default = "ディスク台帳_すべて.csv"
         else:
             if self.cur_disk is None:
-                return
-            if self.is_locked(self.cur_disk) and not self.unlock():
                 return
             targets = [self.cur_disk]
             default = f"{self.disk_row(self.cur_disk)[0]}.csv"

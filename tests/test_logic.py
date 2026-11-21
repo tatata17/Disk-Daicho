@@ -205,23 +205,23 @@ def test_same_name_labels():
     check("ドライブ直下の記録は空", app.recorded_subpath("E:\\", ""), "")
     check("食い違うときは保存値", app.recorded_subpath("E:\\Other", "rec\\anime"), "rec\\anime")
 
-    rows = [  # 名前, ロック中, シリアル, subpath, source
-        ("動画保管01", 0, 0xA3F29B1C, "", "E:\\"),
-        ("音楽HDD", 1, 0x11112222, "", "F:\\"),
-        ("作業用", 0, 0xA3F29B1C, "rec\\anime", "E:\\Rec\\Anime"),
+    rows = [  # 名前, シリアル, subpath, source
+        ("動画保管01", 0xA3F29B1C, "", "E:\\"),
+        ("音楽HDD", 0x11112222, "", "F:\\"),
+        ("作業用", 0xA3F29B1C, "rec\\anime", "E:\\Rec\\Anime"),
     ]
-    check("重複が無ければ従来どおり", app.disk_labels(rows), ["動画保管01", "音楽HDD  (ロック中)", "作業用"])
+    check("重複が無ければ従来どおり", app.disk_labels(rows), ["動画保管01", "音楽HDD", "作業用"])
     rows += [
-        ("動画保管01", 1, 0x5555AAAA, "", "G:\\"),                    # 別のディスクが同名
-        ("作業用", 0, 0xA3F29B1C, "rec\\drama", "E:\\Rec\\Drama"),      # 同じボリュームの別フォルダが同名
-        ("旧記録", 0, None, "", "H:\\"), ("旧記録", 0, None, "old\\x", "H:\\Old\\X"),
+        ("動画保管01", 0x5555AAAA, "", "G:\\"),                    # 別のディスクが同名
+        ("作業用", 0xA3F29B1C, "rec\\drama", "E:\\Rec\\Drama"),      # 同じボリュームの別フォルダが同名
+        ("旧記録", None, "", "H:\\"), ("旧記録", None, "old\\x", "H:\\Old\\X"),
     ]
     check("同名のときだけ見分けを添える", app.disk_labels(rows), [
-        "動画保管01 (A3F2-9B1C)", "音楽HDD  (ロック中)", "作業用 (A3F2-9B1C / Rec\\Anime)",
-        "動画保管01 (5555-AAAA)  (ロック中)", "作業用 (A3F2-9B1C / Rec\\Drama)",
+        "動画保管01 (A3F2-9B1C)", "音楽HDD", "作業用 (A3F2-9B1C / Rec\\Anime)",
+        "動画保管01 (5555-AAAA)", "作業用 (A3F2-9B1C / Rec\\Drama)",
         "旧記録", "旧記録 (Old\\X)"])
     check("片方を消すと添え表示も消える", app.disk_labels(rows[1:3] + rows[3:4]),
-          ["音楽HDD  (ロック中)", "作業用", "動画保管01  (ロック中)"])
+          ["音楽HDD", "作業用", "動画保管01"])
 
 
 def test_name_clash_message():
