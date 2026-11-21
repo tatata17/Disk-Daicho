@@ -53,6 +53,7 @@ select,input[type=search]{border:1px solid var(--line);background:var(--panel);b
 .name{word-break:break-all}
 .item.dir .name{font-weight:600}
 .meta{color:var(--sub);font-size:12.5px;display:flex;flex-wrap:wrap;gap:2px 12px}
+.memo{font-size:13px;border-left:3px solid var(--dir);padding-left:8px;margin:2px 0;word-break:break-word}
 .loc{color:var(--sub);font-size:12.5px;word-break:break-all}
 .loc button{border:none;background:none;color:var(--accent);padding:0;text-align:left;word-break:break-all}
 .chip{background:var(--chip);border-radius:20px;padding:0 8px;font-size:12px}
@@ -93,7 +94,7 @@ footer a{color:var(--accent)}
 
   <div class="panel hide" id="browsePanel">
     <div class="row">
-      <input type="search" id="q" class="grow" placeholder="ファイル名・番組名・チャンネル・番組内容を検索" aria-label="検索">
+      <input type="search" id="q" class="grow" placeholder="ファイル名・メモ・番組名・チャンネルなどを検索" aria-label="検索">
       <select id="scope" aria-label="検索範囲"><option value="all">すべてのディスク</option><option value="disk">このディスク</option></select>
       <select id="type" aria-label="種類"></select>
       <button class="primary" id="go">検索</button>
@@ -207,7 +208,7 @@ function addRows(model, rows) {
     throw new Error("ディスク台帳で書き出したCSVではないようです(見出しに「ディスク」「パス」「種別」がありません)。");
   const cExt = col("拡張子"), cSize = col("サイズ(バイト)"), cTime = col("更新日時"),
         cTitle = col("番組名"), cBdate = col("放送日"), cBtime = col("開始時刻"),
-        cCh = col("チャンネル"), cDetail = col("番組内容");
+        cCh = col("チャンネル"), cDetail = col("番組内容"), cNote = col("メモ");
   const get = (r, c) => (c >= 0 && r[c] !== undefined ? r[c] : "");
   let count = 0;
   for (let i = 1; i < rows.length; i++) {
@@ -220,12 +221,13 @@ function addRows(model, rows) {
       const node = getDir(disk, path);
       node.s = size;
       node.m = get(r, cTime);
+      node.note = get(r, cNote);
     } else {
       const k = path.lastIndexOf("\\");
       const parent = getDir(disk, k < 0 ? "" : path.slice(0, k));
       const title = get(r, cTitle);
       const node = { n: k < 0 ? path : path.slice(k + 1), p: parent, d: false, c: null, s: size,
-                     m: get(r, cTime), e: get(r, cExt).toLowerCase(), disk,
+                     m: get(r, cTime), e: get(r, cExt).toLowerCase(), disk, note: get(r, cNote),
                      pi: title || get(r, cCh) || get(r, cDetail)
                        ? { title, bdate: get(r, cBdate), btime: get(r, cBtime), ch: get(r, cCh), detail: get(r, cDetail) }
                        : null };
@@ -254,7 +256,7 @@ function search(model, disks, words, type) {
       if (type === "DIR" ? !x.d : exts ? (x.d || !exts.has(x.e)) : false) continue;
       if (ws.length) {
         if (x.lc === undefined)
-          x.lc = (x.n + (x.pi ? "\n" + x.pi.title + "\n" + x.pi.ch + "\n" + x.pi.detail : "")).toLowerCase();
+          x.lc = (x.n + "\n" + (x.note || "") + (x.pi ? "\n" + x.pi.title + "\n" + x.pi.ch + "\n" + x.pi.detail : "")).toLowerCase();
         let ok = true;
         for (const w of ws) if (!x.lc.includes(w)) { ok = false; break; }
         if (!ok) continue;
@@ -287,7 +289,8 @@ function fmtSize(n) {
 }
 
 const SAMPLE = [
-  ["ディスク","パス","種別","拡張子","サイズ(バイト)","サイズ","更新日時","番組名","放送日","開始時刻","チャンネル","番組内容"],
+  ["ディスク","パス","種別","拡張子","サイズ(バイト)","サイズ","更新日時","番組名","放送日","開始時刻","チャンネル","番組内容","メモ"],
+  ["ポータブルHDD","DISC_0001.iso","ファイル","iso","4294967296","","2026-06-20 15:00","","","","","","家族旅行のビデオをまとめたディスク(架空の例)"],
   ["外付けHDD①","録画","フォルダ","","5368709120","","2026-10-03 21:10"],
   ["外付けHDD①","録画\\そらいろ探検隊","フォルダ","","3221225472","","2026-10-03 21:10"],
   ["外付けHDD①","録画\\そらいろ探検隊\\そらいろ探検隊 第1話,20260905.mkv","ファイル","mkv","1610612736","","2026-09-05 19:40","そらいろ探検隊 第1話","2026/09/05","18:30:00","サンプル放送","空に浮かぶ島を目指して、三人の旅が始まる。\n(これは架空の番組です)"],
@@ -411,6 +414,7 @@ if (typeof document !== "undefined") (function () {
     row.append(el("div", "ico", x.d ? "■" : "・"));
     const body = el("div", "body");
     body.append(el("div", "name", x.n));
+    if (x.note) body.append(el("div", "memo", "メモ: " + x.note));
     const meta = el("div", "meta");
     meta.append(el("span", "", fmtSize(x.s)));
     if (x.m) meta.append(el("span", "", x.m));
