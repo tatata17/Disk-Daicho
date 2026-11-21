@@ -15,6 +15,7 @@
 import csv
 import hashlib
 import io
+import ntpath
 import json
 import os
 import queue
@@ -32,7 +33,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.4"
+APP_VERSION = "2026.11.21.5"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -40,6 +41,10 @@ UPDATE_COMMIT_API = "https://api.github.com/repos/tatata17/Disk-Daicho/commits/m
 UPDATE_BACKUP_KEEP = 5
 UPDATE_MIN_SIZE = 30_000   # これより小さいファイルは「壊れている」として受け付けない
 PAGE_SIZE = 1000
+ACCENT = "#166B5A"         # アクセント色(最上段の検索バーの帯)
+ACCENT_SOFT = "#D5EBE5"    # 帯の上の補足の文字
+BANNER_BG = "#E4F1ED"      # 「接続されています」のバナーの地
+WARN_FG = "#B45309"        # 初期値と違う設定を知らせる色
 IS_WIN = sys.platform.startswith("win")
 
 TYPE_FILTERS = {
@@ -261,6 +266,132 @@ def find_recorded(conn, serial, sub):
                         "ORDER BY recorded_at DESC", (serial, sub)).fetchone()
 
 
+# ---------------------------------------------------------------- 記録の設定・接続中ディスク・差分
+def rec_summary(folders_only, depth_mode, depth, info_csv):
+    """詳細設定の要約(畳んでいても見せる文)と、初期値どおりかどうかを返す"""
+    parts = ["フォルダのみ" if folders_only else "フォルダ＋ファイル",
+             f"{depth}階層まで" if depth_mode else "全階層",
+             "csv読取ON" if info_csv else "csv読取OFF"]
+    return " / ".join(parts), (not folders_only and not depth_mode and bool(info_csv))
+
+
+def load_rec_options(conn):
+    """settings に保存した詳細設定を読む。無い・壊れている値は初期値にする"""
+    got = dict(conn.execute("SELECT key,value FROM settings WHERE key IN "
+                            "('rec_scope','rec_depth_mode','rec_depth','rec_info_csv')"))
+    try:
+        depth = max(1, min(99, int(got.get("rec_depth", "2"))))
+    except (TypeError, ValueError):
+        depth = 2
+    return {"folders_only": got.get("rec_scope") == "1",
+            "depth_mode": got.get("rec_depth_mode") == "1",
+            "depth": depth,
+            "info_csv": got.get("rec_info_csv", "1") != "0"}
+
+
+def save_rec_options(conn, opts):
+    with conn:
+        conn.executemany("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", [
+            ("rec_scope", "1" if opts["folders_only"] else "0"),
+            ("rec_depth_mode", "1" if opts["depth_mode"] else "0"),
+            ("rec_depth", str(int(opts["depth"]))),
+            ("rec_info_csv", "1" if opts["info_csv"] else "0")])
+
+
+def disk_info_csv(conn, disk_id):
+    """
+    そのディスクを前回記録したとき、番組情報csvを読み取ったかどうか(ワンクリック更新で引き継ぐ値)。
+    記録のたびに settings の info_csv_<ディスクid> に残している。残っていない旧記録は、
+    番組情報が1件でもあれば「読み取った」とみなす。それも無いときは、失うものが無いので既定(読み取る)にする。
+    """
+    r = conn.execute("SELECT value FROM settings WHERE key=?", (f"info_csv_{disk_id}",)).fetchone()
+    if r:
+        return r[0] != "0"
+    return True
+
+
+def info_csv_source(conn, disk_id):
+    """disk_info_csv の値の出どころ: 'saved'(保存値) / 'programs'(番組情報ありから推定) / 'default'"""
+    if conn.execute("SELECT 1 FROM settings WHERE key=?", (f"info_csv_{disk_id}",)).fetchone():
+        return "saved"
+    if conn.execute("SELECT 1 FROM programs WHERE disk_id=? LIMIT 1", (disk_id,)).fetchone():
+        return "programs"
+    return "default"
+
+
+def connected_records(conn, drives, isdir=os.path.isdir):
+    """
+    いま接続されているドライブのうち、記録済みのもの(フォルダ指定で記録したものも含む)を返す:
+    [(ディスクid, 名前, 今のパス, 前回の記録日時)]。
+    ドライブ文字は変わるので、記録時のパス(source)は使わず、ボリュームシリアル番号で今のドライブを
+    見つけて「今のドライブ + ドライブ内のパス」を組み立て、実際にあるものだけを返す。
+    """
+    roots = {}
+    for _disp, root, _label, serial in drives:
+        if serial is not None:
+            roots.setdefault(serial, root)
+    out, seen = [], set()
+    if not roots:
+        return out
+    for did, name, source, serial, sub, rec_at, order in conn.execute(
+            "SELECT id,name,source,serial,COALESCE(subpath,''),recorded_at,sort_order FROM disks "
+            "WHERE serial IS NOT NULL ORDER BY recorded_at DESC").fetchall():
+        root = roots.get(serial)
+        if root is None or (serial, sub) in seen:
+            continue  # 同じ場所を別々に記録してあるときは、新しいほうだけ
+        seen.add((serial, sub))
+        path = root
+        if sub:
+            # subpath は小文字にそろえてあるので、表示用に記録時のつづりを使う(同じ場所のときだけ)
+            tail = ntpath.splitdrive(source or "")[1].strip("\\/")
+            path = ntpath.join(root, tail if tail.lower() == sub else sub)
+        if isdir(path):
+            out.append((order, did, name, path, rec_at))
+    return [x[1:] for x in sorted(out, key=lambda x: (x[0] is None, x[0], x[1]))]
+
+
+def entry_paths(cur, disk_id, dirs_only=False):
+    """{ディスク内のパス: サイズ} を返す(差分用)。dirs_only ならフォルダ、そうでなければファイルが対象"""
+    dirs = {0: ""}
+    out = {}
+    for eid, pid, name, is_dir, size in cur.execute(
+            "SELECT id,parent_id,name,is_dir,size FROM entries WHERE disk_id=? ORDER BY id",
+            (disk_id,)):
+        base = dirs.get(pid, "")
+        path = f"{base}\\{name}" if base else name
+        if is_dir:
+            dirs[eid] = path  # id順に読むので、親は必ず子より先に来る
+            if dirs_only:
+                out[path] = size or 0
+        elif not dirs_only:
+            out[path] = size or 0
+    return out
+
+
+def diff_entries(old, new):
+    """(新規の件数, 削除の件数, サイズが変わった件数) を返す。old/new は entry_paths の結果"""
+    added = sum(1 for k in new if k not in old)
+    removed = sum(1 for k in old if k not in new)
+    changed = sum(1 for k, v in new.items() if k in old and old[k] != v)
+    return added, removed, changed
+
+
+def fmt_delta(n):
+    if not n:
+        return "±0"
+    return ("+" if n > 0 else "-") + fmt_size(abs(n))
+
+
+def fmt_diff(diff):
+    """差分 (新規, 削除, サイズ変化, 合計の増減, フォルダ対象か) を1行の文にする"""
+    added, removed, changed, delta, dirs_only = diff
+    unit = "フォルダ" if dirs_only else "ファイル"
+    if not (added or removed or changed):
+        return f"前回の記録から{unit}の変化はありません (合計 {fmt_delta(delta)})"
+    return (f"新規 {added:,}件 / 削除 {removed:,}件 / サイズ変化 {changed:,}件 / "
+            f"合計 {fmt_delta(delta)}" + (" (フォルダで比較)" if dirs_only else ""))
+
+
 def parse_sidecar_csv(path):
     """
     m2ts-encoder のバッチが作る番組情報csv (UTF-16・タブ区切り、1行目が
@@ -362,6 +493,7 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
         dir_size = {0: 0}
         dir_parent = {}
         n_files = n_dirs = n_skipped = n_info = 0
+        diff = None
         rows = []
         prog_rows = []
         stack = [(root, 0, 1)]
@@ -457,6 +589,13 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
             if old:
                 cur.execute("UPDATE disks SET sort_order=?,pw_salt=?,pw_hash=? WHERE id=?",
                             (old[0], old[1], old[2], disk_id))
+                # 差分: 古い記録を消す前に、古い側と新しい側のパスを突き合わせる(その場で計算して捨てる)
+                prev = cur.execute("SELECT folders_only,used FROM disks WHERE id=?",
+                                   (replace_id,)).fetchone()
+                dirs_only = bool(folders_only or prev[0])
+                diff = diff_entries(entry_paths(cur, replace_id, dirs_only),
+                                    entry_paths(cur, disk_id, dirs_only)) + \
+                    (dir_size[0] - (prev[1] or 0), dirs_only)
             # メモは「ディスク内のパス」で覚えているので、記録し直しても同じ場所のファイルに付け直す。
             # 見つからない(移動・改名・削除された)メモも消さずに残し、次に見つかったとき付け直す。
             for nid, npath in cur.execute("SELECT id,path FROM notes WHERE disk_id=?",
@@ -474,8 +613,12 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
             cur.execute("DELETE FROM entries WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM programs WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM disks WHERE id=?", (replace_id,))
+            cur.execute("DELETE FROM settings WHERE key=?", (f"info_csv_{replace_id}",))
+        # 番組情報csvを読み取ったかどうかを、このディスクの値として残す(ワンクリック更新で引き継ぐ)
+        cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                    (f"info_csv_{disk_id}", "1" if read_info else "0"))
         conn.commit()
-        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info))
+        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info, diff))
     except Exception as ex:  # noqa: BLE001
         conn.rollback()
         q.put(("error", f"{type(ex).__name__}: {ex}"))
@@ -673,6 +816,7 @@ class App(tk.Tk):
         self.refresh_disks()
         self.after(100, self._poll)
         self._hide_paired_csv_once()
+        self.after(200, self._initial_focus)
         if self.get_setting("auto_update_check", "1") != "0":
             self.after(1500, lambda: self.check_for_update(manual=False))
 
@@ -832,46 +976,91 @@ class App(tk.Tk):
         st.configure("Title.TLabel", font=("", 14, "bold"))
         st.configure("Treeview", rowheight=24)
 
+        # ---- 最上段: 検索(アクセント色の帯)。検索の入口はここ1か所だけ
+        band = tk.Frame(self, bg=ACCENT)
+        band.pack(fill="x")
+        row = tk.Frame(band, bg=ACCENT)
+        row.pack(fill="x", padx=10, pady=(8, 2))
+        try:
+            self._band_icon = self._app_icon.subsample(2)
+            tk.Label(row, image=self._band_icon, bg=ACCENT).pack(side="left")
+        except (AttributeError, tk.TclError):
+            pass
+        tk.Label(row, text=APP_NAME, bg=ACCENT, fg="white",
+                 font=("", 13, "bold")).pack(side="left", padx=(6, 14))
+        self.var_q = tk.StringVar()
+        self.ent_q = ttk.Entry(row, textvariable=self.var_q, font=("", 11))
+        self.ent_q.pack(side="left", fill="x", expand=True, ipady=2)
+        self.ent_q.bind("<Return>", lambda e: self.do_search())
+        self.cmb_where = ttk.Combobox(row, state="readonly", width=14,
+                                      values=["このディスク", "すべてのディスク"])
+        self.cmb_where.current(1)
+        self.cmb_where.pack(side="left", padx=(6, 3))
+        self.cmb_type = ttk.Combobox(row, state="readonly", width=14, values=list(TYPE_FILTERS))
+        self.cmb_type.current(0)
+        self.cmb_type.pack(side="left")
+        ttk.Button(row, text="検索", command=self.do_search).pack(side="left", padx=(6, 3))
+        ttk.Button(row, text="解除", command=self.clear_search).pack(side="left")
+        tk.Label(band, bg=ACCENT, fg=ACCENT_SOFT, anchor="w", font=("", 9),
+                 text="ファイル名のほか、メモ・番組名・チャンネル・番組内容にもヒットします(Enterで検索)。"
+                      "ロック中のディスクは「すべてのディスク」の検索では対象外です。"
+                 ).pack(fill="x", padx=10, pady=(0, 6))
+
+        # ---- 記録済みのディスクが接続されているときのバナー(無いときは高さ1で見えない)
+        self.banner_box = tk.Frame(self, bg=BANNER_BG, height=1)
+        self.banner_box.pack(fill="x")
+        self.banner_buttons = []
+
+        # ---- 記録する(普段使うものだけ。細かい設定は「詳細設定」に畳む)
         top = ttk.LabelFrame(self, text=" ディスクを記録する ", padding=8)
-        top.pack(fill="x", padx=10, pady=(10, 4))
-        ttk.Label(top, text="① ディスク").grid(row=0, column=0, sticky="w")
+        top.pack(fill="x", padx=10, pady=(8, 4))
         self.cmb_drive = ttk.Combobox(top, state="readonly", width=44)
-        self.cmb_drive.grid(row=1, column=0, sticky="we", padx=(0, 4))
+        self.cmb_drive.grid(row=0, column=0, sticky="we", padx=(0, 4))
         self.cmb_drive.bind("<<ComboboxSelected>>", self._drive_selected)
-        ttk.Button(top, text="再読込", width=7, command=self.reload_drives).grid(row=1, column=1)
-        ttk.Button(top, text="フォルダ指定…", command=self.pick_folder).grid(row=1, column=2, padx=(4, 12))
-        ttk.Label(top, text="② 付ける名前").grid(row=0, column=3, sticky="w")
+        ttk.Button(top, text="再読込", width=7, command=self.reload_drives).grid(row=0, column=1)
+        ttk.Button(top, text="フォルダ指定…", command=self.pick_folder).grid(row=0, column=2, padx=(4, 14))
+        ttk.Label(top, text="名前").grid(row=0, column=3, padx=(0, 4))
         self.var_name = tk.StringVar()
-        ttk.Entry(top, textvariable=self.var_name, width=26).grid(row=1, column=3, sticky="we", padx=(0, 12))
-        ttk.Label(top, text="③ 記録範囲").grid(row=0, column=4, sticky="w")
-        self.cmb_scope = ttk.Combobox(top, state="readonly", width=16,
-                                      values=["フォルダ＋ファイル", "フォルダのみ"])
-        self.cmb_scope.current(0)
-        self.cmb_scope.grid(row=1, column=4, padx=(0, 12))
-        ttk.Label(top, text="④ 階層").grid(row=0, column=5, sticky="w")
-        fr = ttk.Frame(top)
-        fr.grid(row=1, column=5, padx=(0, 12))
-        self.cmb_depth = ttk.Combobox(fr, state="readonly", width=12,
-                                      values=["すべての階層", "階層を指定"])
-        self.cmb_depth.current(0)
-        self.cmb_depth.pack(side="left")
-        self.cmb_depth.bind("<<ComboboxSelected>>", lambda e: self.spn_depth.configure(
-            state="normal" if self.cmb_depth.current() == 1 else "disabled"))
-        self.var_depth = tk.IntVar(value=2)
-        self.spn_depth = ttk.Spinbox(fr, from_=1, to=99, width=4, textvariable=self.var_depth,
-                                     state="disabled")
-        self.spn_depth.pack(side="left", padx=3)
-        ttk.Label(fr, text="階層まで").pack(side="left")
+        ttk.Entry(top, textvariable=self.var_name, width=26).grid(row=0, column=4, sticky="we", padx=(0, 12))
         self.btn_rec = ttk.Button(top, text="記録する", command=self.start_scan)
-        self.btn_rec.grid(row=1, column=6, padx=2)
+        self.btn_rec.grid(row=0, column=5, padx=2)
         self.btn_stop = ttk.Button(top, text="中止", command=self.cancel.set, state="disabled")
-        self.btn_stop.grid(row=1, column=7, padx=2)
-        self.var_info_csv = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="動画と同名のcsv(m2ts-encoderの番組情報)を読み取る (読み取ったcsvは一覧に出しません)",
-                        variable=self.var_info_csv).grid(row=2, column=0, columnspan=6,
-                                                         sticky="w", pady=(6, 0))
+        self.btn_stop.grid(row=0, column=6, padx=2)
         top.columnconfigure(0, weight=2)
-        top.columnconfigure(3, weight=1)
+        top.columnconfigure(4, weight=1)
+
+        # 詳細設定の見出し。畳んでいても、今の設定の要約をいつも出す
+        self.adv_open = False
+        self.lbl_adv = tk.Label(top, anchor="w", cursor="hand2", takefocus=1, font=("", 9))
+        self.lbl_adv.grid(row=1, column=0, columnspan=7, sticky="we", pady=(8, 0))
+        for seq in ("<Button-1>", "<Return>", "<space>"):
+            self.lbl_adv.bind(seq, self._toggle_adv)
+        self.adv = ttk.Frame(top)
+        opts = load_rec_options(self.conn)
+        self._rec_loading = True
+        ttk.Label(self.adv, text="記録範囲").pack(side="left")
+        self.cmb_scope = ttk.Combobox(self.adv, state="readonly", width=16,
+                                      values=["フォルダ＋ファイル", "フォルダのみ"])
+        self.cmb_scope.current(1 if opts["folders_only"] else 0)
+        self.cmb_scope.pack(side="left", padx=(4, 14))
+        self.cmb_scope.bind("<<ComboboxSelected>>", self._rec_changed)
+        ttk.Label(self.adv, text="階層").pack(side="left")
+        self.cmb_depth = ttk.Combobox(self.adv, state="readonly", width=12,
+                                      values=["すべての階層", "階層を指定"])
+        self.cmb_depth.current(1 if opts["depth_mode"] else 0)
+        self.cmb_depth.pack(side="left", padx=(4, 0))
+        self.cmb_depth.bind("<<ComboboxSelected>>", self._rec_changed)
+        self.var_depth = tk.IntVar(value=opts["depth"])
+        self.spn_depth = ttk.Spinbox(self.adv, from_=1, to=99, width=4, textvariable=self.var_depth,
+                                     state="normal" if opts["depth_mode"] else "disabled")
+        self.spn_depth.pack(side="left", padx=3)
+        ttk.Label(self.adv, text="階層まで (ディスク直下が1階層)").pack(side="left", padx=(0, 14))
+        self.var_info_csv = tk.BooleanVar(value=opts["info_csv"])
+        ttk.Checkbutton(self.adv, text="動画と同名のcsv(m2ts-encoderの番組情報)を読み取る",
+                        variable=self.var_info_csv, command=self._rec_changed).pack(side="left")
+        self.var_depth.trace_add("write", self._rec_changed)
+        self._rec_loading = False
+        self._update_rec_summary()
 
         self.var_status = tk.StringVar(value="記録したいディスクを選んで「記録する」を押してください。")
         ttk.Label(self, textvariable=self.var_status, anchor="w", relief="sunken",
@@ -930,24 +1119,7 @@ class App(tk.Tk):
         ttk.Button(r2, text="↑", width=3, command=self.go_up).pack(side="left", padx=3)
         self.var_path = tk.StringVar()
         ttk.Entry(r2, textvariable=self.var_path, state="readonly").pack(side="left", fill="x", expand=True)
-
-        r3 = ttk.Frame(right)
-        r3.pack(fill="x", pady=6)
-        self.var_q = tk.StringVar()
-        ent = ttk.Entry(r3, textvariable=self.var_q)
-        ent.pack(side="left", fill="x", expand=True)
-        ent.bind("<Return>", lambda e: self.do_search())
-        ttk.Label(right, text="検索はファイル名のほか、メモ・番組名・チャンネル・番組内容にもヒットします。",
-                  foreground="#777").pack(fill="x")
-        self.cmb_where = ttk.Combobox(r3, state="readonly", width=14,
-                                      values=["このディスク", "すべてのディスク"])
-        self.cmb_where.current(1)
-        self.cmb_where.pack(side="left", padx=3)
-        self.cmb_type = ttk.Combobox(r3, state="readonly", width=14, values=list(TYPE_FILTERS))
-        self.cmb_type.current(0)
-        self.cmb_type.pack(side="left")
-        ttk.Button(r3, text="検索", command=self.do_search).pack(side="left", padx=3)
-        ttk.Button(r3, text="解除", command=self.clear_search).pack(side="left")
+        ttk.Frame(right, height=6).pack(fill="x")
 
         tf = ttk.Frame(right)
         cols = ("note", "size", "mtime", "ext", "bdate", "channel", "loc")
@@ -996,6 +1168,99 @@ class App(tk.Tk):
         ttk.Button(r5, text="メモを書く…", command=self.edit_note).pack(side="right", padx=(0, 12))
         tf.pack(fill="both", expand=True)
 
+    # ---------------- 詳細設定(畳む・要約・保存)
+    def _rec_options(self):
+        try:
+            depth = max(1, min(99, int(self.var_depth.get())))
+        except (tk.TclError, ValueError):
+            depth = 2
+        return {"folders_only": self.cmb_scope.current() == 1,
+                "depth_mode": self.cmb_depth.current() == 1,
+                "depth": depth, "info_csv": bool(self.var_info_csv.get())}
+
+    def _update_rec_summary(self):
+        o = self._rec_options()
+        text, is_default = rec_summary(o["folders_only"], o["depth_mode"], o["depth"], o["info_csv"])
+        mark = "▾" if self.adv_open else "▸"
+        self.lbl_adv.configure(
+            text=f"{mark} 詳細設定:  {text}" + ("" if is_default else "   ← 初期値と違う設定です"),
+            fg="#444444" if is_default else WARN_FG,
+            font=("", 9) if is_default else ("", 9, "bold"))
+
+    def _rec_changed(self, *_a):
+        if getattr(self, "_rec_loading", True):
+            return
+        self.spn_depth.configure(state="normal" if self.cmb_depth.current() == 1 else "disabled")
+        save_rec_options(self.conn, self._rec_options())
+        self._update_rec_summary()
+
+    def _toggle_adv(self, _e=None):
+        self.adv_open = not self.adv_open
+        if self.adv_open:
+            self.adv.grid(row=2, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        else:
+            self.adv.grid_remove()
+        self._update_rec_summary()
+
+    def _initial_focus(self):
+        """起動時は検索欄へ。ただし「接続されています」のバナーが出ているときは、その更新ボタンへ"""
+        try:
+            (self.banner_buttons[0] if self.banner_buttons else self.ent_q).focus_set()
+        except tk.TclError:
+            pass
+
+    # ---------------- 接続中の記録済みディスク(バナーとワンクリック更新)
+    def refresh_banner(self):
+        for w in self.banner_box.winfo_children():
+            w.destroy()
+        self.banner_buttons = []
+        try:
+            found = connected_records(self.conn, self.drives)
+        except (sqlite3.Error, OSError):
+            found = []
+        if not found:
+            self.banner_box.configure(height=1)
+            return
+        for disk_id, name, path, rec_at in found:
+            row = tk.Frame(self.banner_box, bg=BANNER_BG)
+            row.pack(fill="x", padx=10, pady=3)
+            btn = ttk.Button(row, text="今の内容で更新",
+                             command=lambda d=disk_id, p=path: self.quick_update(d, p))
+            btn.pack(side="right")
+            if self.scanning:
+                btn.configure(state="disabled")
+            self.banner_buttons.append(btn)
+            tk.Label(row, bg=BANNER_BG, fg="#0F3D33", anchor="w",
+                     text=f"「{name}」が接続されています ({path})  ―  前回の記録 {fmt_time(rec_at)}"
+                     ).pack(side="left", fill="x", expand=True)
+
+    def quick_update(self, disk_id, path):
+        """バナーのボタン: 名前・記録範囲・階層・csv読み取りを前回の記録から引き継いで、すぐ記録し直す"""
+        if self.scanning:
+            return
+        r = self.conn.execute("SELECT name,folders_only,max_depth FROM disks WHERE id=?",
+                              (disk_id,)).fetchone()
+        if not r:
+            self.reload_drives()
+            return
+        if not os.path.isdir(path):
+            messagebox.showerror(APP_NAME, f"{path} を開けません。\nディスクが外されていないか確認してください。")
+            self.reload_drives()
+            return
+        self._begin_scan(path, r[0], bool(r[1]), r[2], disk_id, disk_info_csv(self.conn, disk_id))
+
+    def _begin_scan(self, root, name, folders_only, max_depth, replace_id, read_info):
+        self.cancel.clear()
+        self.scanning = True
+        self._scan_name = name
+        self.btn_rec.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        for b in self.banner_buttons:
+            b.configure(state="disabled")
+        self.var_status.set(f"「{name}」の記録を開始します…")
+        threading.Thread(target=scan_disk, daemon=True, args=(
+            root, name, folders_only, max_depth, replace_id, self.cancel, self.q, read_info)).start()
+
     # ---------------- ドライブ選択・記録
     def reload_drives(self):
         self.drives = list_drives()
@@ -1010,6 +1275,7 @@ class App(tk.Tk):
             self.cmb_drive.current(len(vals) - 1)
         else:
             self.cmb_drive.set("ディスクを選択してください" if vals else "「フォルダ指定…」で選んでください")
+        self.refresh_banner()
 
     def pick_folder(self):
         d = filedialog.askdirectory(title="記録するドライブまたはフォルダを選択")
@@ -1063,6 +1329,14 @@ class App(tk.Tk):
             if name != same[1]:
                 msg += f" (名前は「{name}」に変わります)"
             msg += "\nいいえ: 前の記録を残して、別に記録する"
+            prev = self.conn.execute("SELECT folders_only,max_depth FROM disks WHERE id=?",
+                                     (same[0],)).fetchone()
+            o = self._rec_options()
+            now_depth = o["depth"] if o["depth_mode"] else None
+            if prev and (bool(prev[0]) != o["folders_only"] or prev[1] != now_depth):
+                was = rec_summary(bool(prev[0]), prev[1] is not None, prev[1], True)[0].rsplit(" / ", 1)[0]
+                now = rec_summary(o["folders_only"], o["depth_mode"], o["depth"], True)[0].rsplit(" / ", 1)[0]
+                msg += f"\n\n※記録範囲が前回と違います。\n　前回: {was}\n　今回: {now}"
             ans = messagebox.askyesnocancel(APP_NAME, msg)
             if ans is None:
                 return
@@ -1079,20 +1353,9 @@ class App(tk.Tk):
                 return
             if ans:
                 replace_id = row[0]
-        max_depth = None
-        if self.cmb_depth.current() == 1:
-            try:
-                max_depth = max(1, int(self.var_depth.get()))
-            except (tk.TclError, ValueError):
-                max_depth = 2
-        self.cancel.clear()
-        self.scanning = True
-        self.btn_rec.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.var_status.set("記録を開始します…")
-        threading.Thread(target=scan_disk, daemon=True, args=(
-            root, name, self.cmb_scope.current() == 1, max_depth, replace_id,
-            self.cancel, self.q, self.var_info_csv.get())).start()
+        o = self._rec_options()
+        self._begin_scan(root, name, o["folders_only"], o["depth"] if o["depth_mode"] else None,
+                         replace_id, o["info_csv"])
 
     def _poll(self):
         try:
@@ -1107,14 +1370,24 @@ class App(tk.Tk):
                 if msg[0] == "done":
                     skipped = f" (読めなかった場所 {msg[4]:,} 件)" if msg[4] else ""
                     info = f" / 番組情報 {msg[5]:,} 件" if msg[5] else ""
-                    self.var_status.set(f"記録しました。ファイル {msg[2]:,} / フォルダ {msg[3]:,}{info}{skipped}")
+                    text = f"記録しました。ファイル {msg[2]:,} / フォルダ {msg[3]:,}{info}{skipped}"
+                    diff = msg[6]
+                    if diff:
+                        text += "   【前回との差】" + fmt_diff(diff)
+                    self.var_status.set(text)
                     self.path_cache.clear()
                     self.var_name.set("")
                     self.refresh_disks(select_id=msg[1])
                     self.reload_drives()
+                    if diff and any(diff[:3]):  # 変化があったときは、見落とさないようダイアログでも出す
+                        messagebox.showinfo(
+                            APP_NAME, f"「{getattr(self, '_scan_name', '')}」を更新しました。\n\n"
+                            f"前回の記録との差:\n{fmt_diff(diff)}", parent=self)
                 elif msg[0] == "cancel":
-                    self.var_status.set("記録を中止しました。(何も保存されていません)")
+                    self.refresh_banner()
+                    self.var_status.set("記録を中止しました。(前の記録はそのまま残っています)")
                 else:
+                    self.refresh_banner()
                     self.var_status.set("記録に失敗しました。")
                     messagebox.showerror(APP_NAME, f"記録中にエラーが発生しました。\n{msg[1]}")
         except queue.Empty:
@@ -1208,6 +1481,7 @@ class App(tk.Tk):
             with self.conn:
                 self.conn.execute("UPDATE disks SET name=? WHERE id=?", (new.strip(), self.cur_disk))
             self.refresh_disks()
+            self.reload_drives()
 
     def delete_disk(self):
         if self.cur_disk is None:
@@ -1222,10 +1496,12 @@ class App(tk.Tk):
             self.conn.execute("DELETE FROM entries WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM programs WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM notes WHERE disk_id=?", (self.cur_disk,))
+            self.conn.execute("DELETE FROM settings WHERE key=?", (f"info_csv_{self.cur_disk}",))
             self.conn.execute("DELETE FROM disks WHERE id=?", (self.cur_disk,))
         self.path_cache.clear()
         self.cur_disk = None
         self.refresh_disks()
+        self.reload_drives()
         self.var_status.set(f"「{name}」の記録を削除しました。")
 
     # ---------------- パスワード (表示ロック)
