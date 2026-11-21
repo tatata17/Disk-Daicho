@@ -252,8 +252,29 @@ function addRows(model, rows) {
     }
     count++;
   }
-  for (const d of model.disks.values()) d.root.s = d.root.c.reduce((a, x) => a + x.s, 0);
+  for (const d of model.disks.values()) {
+    hidePairedCsv(d);
+    d.root.s = d.root.c.reduce((a, x) => a + x.s, 0);
+  }
   return count;
+}
+
+/* 番組情報として動画に取り込み済みのcsv(同じフォルダに、同名で番組情報つきの動画がある)は一覧から外す。
+   古い版のソフトで書き出したCSVを開いたときも、ソフトと同じ見え方にするため。 */
+function hidePairedCsv(disk) {
+  const stem = n => n.slice(0, n.lastIndexOf(".")).toLowerCase();
+  const drop = new Set();
+  for (const dir of disk.dirs.values()) {
+    const withInfo = new Set();
+    for (const x of dir.c) if (!x.d && x.pi) withInfo.add(stem(x.n));
+    if (!withInfo.size) continue;
+    const keep = dir.c.filter(x => x.d || x.e !== "csv" || !withInfo.has(stem(x.n)) || (drop.add(x), false));
+    if (keep.length !== dir.c.length) dir.c = keep;
+  }
+  if (drop.size) {
+    disk.all = disk.all.filter(x => !drop.has(x));
+    disk.files -= drop.size;
+  }
 }
 
 function nodePath(node) {           // ディスク名を除いた場所
