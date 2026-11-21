@@ -33,7 +33,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.6"
+APP_VERSION = "2026.11.21.7"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -931,6 +931,7 @@ class App(tk.Tk):
             command=lambda: self.set_setting("auto_update_check",
                                              "1" if self.auto_update_var.get() else "0"))
         self._help_menu.add_separator()
+        self._help_menu.add_command(label="キー操作", command=self.show_keys)
         self._help_menu.add_command(label="ビューアのサイトを開く", command=self.open_viewer)
         self._help_menu.add_command(label="バージョン情報", command=lambda: messagebox.showinfo(
             "バージョン情報", f"{APP_NAME}\nバージョン {APP_VERSION}\n\n"
@@ -1186,8 +1187,8 @@ class App(tk.Tk):
 
         r2 = ttk.Frame(right)
         r2.pack(fill="x")
-        ttk.Button(r2, text="←", width=3, command=self.go_back).pack(side="left")
-        ttk.Button(r2, text="↑", width=3, command=self.go_up).pack(side="left", padx=3)
+        ttk.Button(r2, text="← 戻る", command=self.go_back).pack(side="left")
+        ttk.Button(r2, text="↑ 上の階層へ", command=self.go_up).pack(side="left", padx=3)
         self.var_path = tk.StringVar()
         ttk.Entry(r2, textvariable=self.var_path, state="readonly").pack(side="left", fill="x", expand=True)
         ttk.Frame(right, height=6).pack(fill="x")
@@ -1212,6 +1213,11 @@ class App(tk.Tk):
         self.tree.bind("<Double-1>", self._open_item)
         self.tree.bind("<Return>", self._open_item)
         self.tree.bind("<BackSpace>", lambda e: self.go_up())
+        # エクスプローラーと同じキー: Alt+↑ で上の階層、Alt+← で戻る。Ctrl+F で検索欄へ
+        self.bind_all("<Alt-Up>", lambda e: self._nav_key(self.go_up, e))
+        self.bind_all("<Alt-Left>", lambda e: self._nav_key(self.go_back, e))
+        self.bind_all("<Control-f>", self._focus_search)
+        self.ent_q.bind("<Down>", lambda e: (self._select_row(self.tree.focus() or None, True), "break")[1])
         self.tree.bind("<Button-3>", self._popup)
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="パスをコピー", command=self.copy_path)
@@ -1724,6 +1730,47 @@ class App(tk.Tk):
             self.var_count.set("0 件" if self.cur_disk is not None else "")
         self.btn_prev.configure(state="normal" if self.page > 0 else "disabled")
         self.btn_next.configure(state="normal" if more else "disabled")
+        self._select_row()  # 先頭の行を選んでおく(↑↓キーがすぐ効くように)
+
+    def _select_row(self, iid=None, take_focus=False):
+        """行を選び、↑↓キーがそこから動くようにする。iid が無い(または一覧に無い)ときは先頭の行。
+        take_focus=True なら、キー入力の先も一覧に移す"""
+        if iid is None or not self.tree.exists(str(iid)):
+            kids = self.tree.get_children()
+            iid = kids[0] if kids else None
+        if iid is not None:
+            iid = str(iid)
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)   # ツリーの中での「今いる行」。これが無いと↑↓キーが効かない
+            self.tree.see(iid)
+        if take_focus:
+            self.tree.focus_set()
+
+    def _nav_key(self, action, event):
+        if isinstance(event.widget, ttk.Combobox):  # 選択欄の上では、選択欄のキー操作を優先
+            return None
+        action()
+        return "break"
+
+    def _focus_search(self, _e=None):
+        self.ent_q.focus_set()
+        self.ent_q.selection_range(0, "end")
+        return "break"
+
+    def show_keys(self):
+        messagebox.showinfo(
+            "キー操作",
+            "【一覧(右側)で】\n"
+            "　↑ ↓　　　　　行を移動\n"
+            "　Enter　　　　フォルダを開く\n"
+            "　BackSpace　　上の階層へ\n\n"
+            "【どこでも】\n"
+            "　Alt + ↑　　　上の階層へ\n"
+            "　Alt + ←　　　戻る(直前に見ていたフォルダ)\n"
+            "　Ctrl + F　　　検索欄へ\n\n"
+            "【検索欄で】\n"
+            "　Enter　　　　検索\n"
+            "　↓　　　　　　一覧へ移る", parent=self)
 
     def _show_detail(self, _e=None):
         sel = self.tree.selection()
@@ -1766,7 +1813,7 @@ class App(tk.Tk):
         yview = self.tree.yview()
         self.show()
         if self.tree.exists(str(eid)):
-            self.tree.selection_set(str(eid))
+            self._select_row(eid, True)
             self.tree.yview_moveto(yview[0])
         self.var_status.set("メモを保存しました。" if new else "メモを消しました。")
 
@@ -1783,6 +1830,7 @@ class App(tk.Tk):
     def turn_page(self, d):
         self.page = max(0, self.page + d)
         self.show()
+        self.tree.focus_set()
 
     # ---------------- 移動
     def goto(self, disk_id, folder, keep_history=True):
@@ -1791,6 +1839,7 @@ class App(tk.Tk):
                 self.lst.selection_clear(0, "end")
                 self.lst.selection_set(self.disk_ids.index(disk_id))
             self.open_disk(disk_id, folder)
+            self.tree.focus_set()
             return
         if keep_history and not self.search_mode:
             self.history.append(self.cur_folder)
@@ -1798,6 +1847,7 @@ class App(tk.Tk):
         self.cur_folder = folder
         self.page = 0
         self.show()
+        self.tree.focus_set()  # 開いたあと、そのまま↑↓キーで動けるように
 
     def _open_item(self, _e=None):
         sel = self.tree.selection()
@@ -1809,9 +1859,7 @@ class App(tk.Tk):
             self.goto(disk_id, eid)
         elif self.search_mode:
             self.goto(disk_id, pid)
-            if self.tree.exists(str(eid)):
-                self.tree.selection_set(str(eid))
-                self.tree.see(str(eid))
+            self._select_row(eid, True)
 
     def go_up(self):
         if self.search_mode:
@@ -1820,17 +1868,17 @@ class App(tk.Tk):
             r = self.conn.execute("SELECT parent_id FROM entries WHERE id=?", (self.cur_folder,)).fetchone()
             came_from = self.cur_folder
             self.goto(self.cur_disk, r[0] if r else 0)
-            if self.tree.exists(str(came_from)):
-                self.tree.selection_set(str(came_from))
-                self.tree.see(str(came_from))
+            self._select_row(came_from, True)  # 出てきたフォルダを選んだ状態にする(エクスプローラーと同じ)
 
     def go_back(self):
         if self.search_mode:
             self.clear_search()
         elif self.history:
+            came_from = self.cur_folder
             self.cur_folder = self.history.pop()
             self.page = 0
             self.show()
+            self._select_row(came_from, True)  # 出てきたフォルダが一覧にあれば、それを選ぶ
 
     # ---------------- 検索
     def do_search(self):
@@ -1917,9 +1965,7 @@ class App(tk.Tk):
             eid = int(sel[0])
             disk_id, pid, _n, _d = self.row_info[eid]
             self.goto(disk_id, pid)
-            if self.tree.exists(str(eid)):
-                self.tree.selection_set(str(eid))
-                self.tree.see(str(eid))
+            self._select_row(eid, True)
 
     # ---------------- 書き出し
     def export_csv(self, all_disks):
