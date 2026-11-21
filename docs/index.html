@@ -22,8 +22,10 @@ h1{font-size:20px;margin:4px 0 2px}
 .lead{color:var(--sub);margin:0 0 14px;font-size:13px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
 button,select,input{font:inherit;color:inherit}
-button{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 12px;cursor:pointer}
-button:hover{background:var(--hover)}
+button,a.btn{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 12px;cursor:pointer}
+a.btn{display:inline-block;color:var(--accent);text-decoration:none;font-weight:600}
+.note a{color:var(--accent)}
+button:hover,a.btn:hover{background:var(--hover)}
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
 button:disabled{opacity:.45;cursor:default}
 select,input[type=search]{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 9px;min-width:0}
@@ -81,6 +83,17 @@ footer a{color:var(--accent)}
     </div>
     <p class="note">ファイルはこのブラウザの中だけで読み込まれます。サーバーなど外部には一切送信されません。ページを閉じると内容は消えます。</p>
     <p class="note" id="msg" role="status"></p>
+  </div>
+
+  <div class="panel" id="dlPanel">
+    <div class="row">
+      <div class="grow">
+        <b>ソフト本体 (Windows用)</b>
+        <div class="note" style="margin:0">ディスクの中身を記録してCSVを書き出すソフトです。動かすには <a href="https://www.python.org/">Python</a> が必要です。</div>
+      </div>
+      <a class="btn" id="dl" href="https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/disk_daicho.pyw" download="disk_daicho.pyw">disk_daicho.pyw をダウンロード</a>
+    </div>
+    <p class="note hide" id="dlMsg" role="status"></p>
   </div>
 
   <div class="panel hide" id="viewPanel">
@@ -480,6 +493,30 @@ if (typeof document !== "undefined") (function () {
     render();
   };
   $("more").onclick = () => { const from = shown; shown += PAGE; appendRows(from); };
+
+  // 本体のダウンロード: GitHubにある最新版を取ってきて、ファイルとして保存させる
+  $("dl").onclick = async e => {
+    e.preventDefault();
+    const a = e.currentTarget, msg = $("dlMsg");
+    msg.classList.remove("hide");
+    msg.textContent = "ダウンロードしています…";
+    try {
+      const res = await fetch(a.href, { cache: "no-store" });
+      if (!res.ok) throw new Error(res.status);
+      const url = URL.createObjectURL(new Blob([await res.blob()], { type: "application/octet-stream" }));
+      const tmp = document.createElement("a");
+      tmp.href = url;
+      tmp.download = "disk_daicho.pyw";
+      document.body.append(tmp);
+      tmp.click();
+      tmp.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      msg.textContent = "ダウンロードしました。好きなフォルダに置いて、ダブルクリックで起動してください。";
+    } catch (err) {
+      msg.textContent = "ダウンロードできませんでした。GitHubのページを開きます。";
+      location.href = "https://github.com/tatata17/Disk-Daicho/blob/main/disk_daicho.pyw";
+    }
+  };
 
   const drop = $("drop");
   ["dragenter", "dragover"].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
