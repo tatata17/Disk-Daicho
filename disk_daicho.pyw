@@ -6,6 +6,7 @@
 
 ・m2ts-encoder が動画と同名で出力する番組情報csv(rplsinfoの出力)も読み取り、
   番組名・放送日・チャンネル・番組内容を一緒に記録して検索できる
+・ファイルやフォルダごとにメモを書ける (名前を付け直していないisoなどに「これは何のファイルか」を残せる)
 ・標準ライブラリのみで動作 (Python 3.8 以降 / Windows 想定)
 ・記録データはこのファイルと同じフォルダの disk_daicho.db (SQLite) に保存
 """
@@ -209,6 +210,10 @@ CREATE TABLE IF NOT EXISTS programs(
     entry_id INTEGER PRIMARY KEY, disk_id INTEGER NOT NULL, title TEXT, bdate TEXT,
     btime TEXT, channel TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS idx_programs_disk ON programs(disk_id);
+CREATE TABLE IF NOT EXISTS notes(
+    id INTEGER PRIMARY KEY, disk_id INTEGER NOT NULL, path TEXT NOT NULL,
+    entry_id INTEGER, note TEXT);
+CREATE INDEX IF NOT EXISTS idx_notes_entry ON notes(entry_id);
 """
 
 
@@ -334,6 +339,20 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
             if old:
                 cur.execute("UPDATE disks SET sort_order=?,pw_salt=?,pw_hash=? WHERE id=?",
                             (old[0], old[1], old[2], disk_id))
+            # メモは「ディスク内のパス」で覚えているので、記録し直しても同じ場所のファイルに付け直す。
+            # 見つからない(移動・改名・削除された)メモも消さずに残し、次に見つかったとき付け直す。
+            for nid, npath in cur.execute("SELECT id,path FROM notes WHERE disk_id=?",
+                                          (replace_id,)).fetchall():
+                eid, parent = None, 0
+                for part in npath.split("\\"):
+                    r = cur.execute("SELECT id FROM entries WHERE disk_id=? AND parent_id=? "
+                                    "AND name=?", (disk_id, parent, part)).fetchone()
+                    if not r:
+                        eid = None
+                        break
+                    eid = parent = r[0]
+                cur.execute("UPDATE notes SET disk_id=?,entry_id=? WHERE id=?",
+                            (disk_id, eid, nid))
             cur.execute("DELETE FROM entries WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM programs WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM disks WHERE id=?", (replace_id,))
@@ -347,8 +366,9 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
 
 
 SELECT_ROWS = ("SELECT e.id,e.disk_id,e.parent_id,e.name,e.is_dir,e.size,e.mtime,e.ext,"
-               "p.title,p.bdate,p.btime,p.channel,p.detail "
-               "FROM entries e LEFT JOIN programs p ON p.entry_id=e.id")
+               "p.title,p.bdate,p.btime,p.channel,p.detail,nt.note "
+               "FROM entries e LEFT JOIN programs p ON p.entry_id=e.id "
+               "LEFT JOIN notes nt ON nt.entry_id=e.id")
 
 
 # ---------------------------------------------------------------- 画面
@@ -374,6 +394,7 @@ class App(tk.Tk):
         self.sort_col, self.sort_desc = "name", False
         self.row_info = {}
         self.prog_info = {}
+        self.note_info = {}
         self.path_cache = {}
         self._build()
         self.reload_drives()
@@ -492,6 +513,8 @@ class App(tk.Tk):
         ent = ttk.Entry(r3, textvariable=self.var_q)
         ent.pack(side="left", fill="x", expand=True)
         ent.bind("<Return>", lambda e: self.do_search())
+        ttk.Label(right, text="検索はファイル名のほか、メモ・番組名・チャンネル・番組内容にもヒットします。",
+                  foreground="#777").pack(fill="x")
         self.cmb_where = ttk.Combobox(r3, state="readonly", width=14,
                                       values=["このディスク", "すべてのディスク"])
         self.cmb_where.current(1)
@@ -503,16 +526,17 @@ class App(tk.Tk):
         ttk.Button(r3, text="解除", command=self.clear_search).pack(side="left")
 
         tf = ttk.Frame(right)
-        cols = ("size", "mtime", "ext", "bdate", "channel", "loc")
+        cols = ("note", "size", "mtime", "ext", "bdate", "channel", "loc")
         self.tree = ttk.Treeview(tf, columns=cols, selectmode="browse")
-        for cid, text, w, anchor in (("#0", "名前", 380, "w"), ("size", "サイズ", 100, "e"),
+        for cid, text, w, anchor in (("#0", "名前", 360, "w"), ("note", "メモ", 200, "w"),
+                                     ("size", "サイズ", 100, "e"),
                                      ("mtime", "更新日時", 130, "w"), ("ext", "種類", 70, "w"),
                                      ("bdate", "放送日時", 130, "w"),
                                      ("channel", "チャンネル", 130, "w"),
                                      ("loc", "場所", 300, "w")):
             key = "name" if cid == "#0" else cid
             self.tree.heading(cid, text=text, command=lambda k=key: self.sort_by(k))
-            self.tree.column(cid, width=w, anchor=anchor, stretch=(cid in ("#0", "loc")))
+            self.tree.column(cid, width=w, anchor=anchor, stretch=(cid in ("#0", "note", "loc")))
         ys = ttk.Scrollbar(tf, command=self.tree.yview)
         self.tree.configure(yscrollcommand=ys.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -526,6 +550,8 @@ class App(tk.Tk):
         self.menu.add_command(label="パスをコピー", command=self.copy_path)
         self.menu.add_command(label="名前をコピー", command=lambda: self.copy_path(name_only=True))
         self.menu.add_command(label="このフォルダの場所へ移動", command=self.jump_to_location)
+        self.menu.add_separator()
+        self.menu.add_command(label="メモを書く…", command=self.edit_note)
 
         self.lock_frame = ttk.Frame(tf)
         ttk.Label(self.lock_frame, text="このディスクの記録はロックされています。\n"
@@ -543,6 +569,7 @@ class App(tk.Tk):
         self.btn_next.pack(side="right")
         self.btn_prev = ttk.Button(r5, text="前へ", command=lambda: self.turn_page(-1))
         self.btn_prev.pack(side="right", padx=4)
+        ttk.Button(r5, text="メモを書く…", command=self.edit_note).pack(side="right", padx=(0, 12))
         tf.pack(fill="both", expand=True)
 
     # ---------------- ドライブ選択・記録
@@ -770,6 +797,7 @@ class App(tk.Tk):
         with self.conn:
             self.conn.execute("DELETE FROM entries WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM programs WHERE disk_id=?", (self.cur_disk,))
+            self.conn.execute("DELETE FROM notes WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM disks WHERE id=?", (self.cur_disk,))
         self.path_cache.clear()
         self.cur_disk = None
@@ -844,7 +872,7 @@ class App(tk.Tk):
 
     def _order_sql(self):
         col = {"name": "e.name COLLATE NOCASE", "size": "e.size", "mtime": "e.mtime",
-               "ext": "e.ext", "bdate": "p.bdate || p.btime", "channel": "p.channel",
+               "ext": "e.ext", "note": "COALESCE(nt.note,'') = '', nt.note", "bdate": "p.bdate || p.btime", "channel": "p.channel",
                "loc": "e.disk_id, e.parent_id"}[self.sort_col]
         return (f"ORDER BY e.is_dir DESC, {col} {'DESC' if self.sort_desc else 'ASC'}, "
                 "e.name COLLATE NOCASE")
@@ -874,12 +902,13 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.row_info = {}
         self.prog_info = {}
+        self.note_info = {}
         more = len(rows) > PAGE_SIZE
         rows = rows[:PAGE_SIZE]
         names = {}
         has_info = False
         for (eid, disk_id, pid, name, is_dir, size, mtime, ext,
-             title, bdate, btime, channel, detail) in rows:
+             title, bdate, btime, channel, detail, note) in rows:
             loc = ""
             if title is not None:
                 has_info = True
@@ -888,13 +917,15 @@ class App(tk.Tk):
                     names[disk_id] = self.disk_row(disk_id)[0]
                 loc = f"{names[disk_id]}\\{self.path_of(pid)}"
             self.tree.insert("", "end", iid=str(eid), text=("■ " if is_dir else "　 ") + name,
-                             values=(fmt_size(size), fmt_time(mtime),
+                             values=((note or "").replace("\n", " "), fmt_size(size), fmt_time(mtime),
                                      "フォルダ" if is_dir else ext,
                                      f"{bdate or ''} {btime or ''}".strip(), channel or "", loc))
             self.row_info[eid] = (disk_id, pid, name, is_dir)
             if title is not None:
                 self.prog_info[eid] = (title, bdate, btime, channel, detail)
-        shown = ["size", "mtime", "ext"]
+            if note:
+                self.note_info[eid] = note
+        shown = ["note", "size", "mtime", "ext"]
         if has_info:  # 番組情報がある一覧のときだけ列を出す
             shown += ["bdate", "channel"]
         if show_loc:
@@ -914,16 +945,46 @@ class App(tk.Tk):
         sel = self.tree.selection()
         info = self.prog_info.get(int(sel[0])) if sel else None
         text = ""
+        note = self.note_info.get(int(sel[0])) if sel else None
+        if note:
+            text = f"メモ: {note}\n"
         if info:
             title, bdate, btime, channel, detail = info
             head = "  /  ".join(x for x in (f"{bdate or ''} {btime or ''}".strip(), channel) if x)
-            text = f"【{title}】  {head}"
+            text += f"【{title}】  {head}"
             if detail:
                 text += "\n" + detail
         self.txt_detail.configure(state="normal")
         self.txt_detail.delete("1.0", "end")
         self.txt_detail.insert("1.0", text)
         self.txt_detail.configure(state="disabled")
+
+    def edit_note(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo(APP_NAME, "メモを書きたいファイルかフォルダを選んでください。")
+            return
+        eid = int(sel[0])
+        disk_id, _pid, name, _d = self.row_info[eid]
+        old = self.note_info.get(eid, "")
+        new = simpledialog.askstring(
+            APP_NAME, f"{name}\n\nメモ (空にして OK を押すとメモを消します):\n"
+            "※台帳に書くだけで、ディスクのファイルには何も書き込みません。",
+            initialvalue=old, parent=self)
+        if new is None:
+            return
+        new = new.strip()
+        with self.conn:
+            self.conn.execute("DELETE FROM notes WHERE entry_id=?", (eid,))
+            if new:
+                self.conn.execute("INSERT INTO notes(disk_id,path,entry_id,note) VALUES(?,?,?,?)",
+                                  (disk_id, self.path_of(eid), eid, new))
+        yview = self.tree.yview()
+        self.show()
+        if self.tree.exists(str(eid)):
+            self.tree.selection_set(str(eid))
+            self.tree.yview_moveto(yview[0])
+        self.var_status.set("メモを保存しました。" if new else "メモを消しました。")
 
     def sort_by(self, key):
         if key == "loc" and not self.search_mode:
@@ -1021,8 +1082,9 @@ class App(tk.Tk):
         for w in words:
             w = w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             where.append("(e.name LIKE ? ESCAPE '\\' OR p.title LIKE ? ESCAPE '\\' "
-                         "OR p.channel LIKE ? ESCAPE '\\' OR p.detail LIKE ? ESCAPE '\\')")
-            args += [f"%{w}%"] * 4
+                         "OR p.channel LIKE ? ESCAPE '\\' OR p.detail LIKE ? ESCAPE '\\' "
+                         "OR nt.note LIKE ? ESCAPE '\\')")
+            args += [f"%{w}%"] * 5
         if tfilter == "DIR":
             where.append("e.is_dir=1")
         elif tfilter:
@@ -1102,13 +1164,13 @@ class App(tk.Tk):
             with open(fn, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 w.writerow(["ディスク", "パス", "種別", "拡張子", "サイズ(バイト)", "サイズ", "更新日時",
-                            "番組名", "放送日", "開始時刻", "チャンネル", "番組内容"])
+                            "番組名", "放送日", "開始時刻", "チャンネル", "番組内容", "メモ"])
                 n = 0
                 for d in targets:
                     dname = self.disk_row(d)[0]
                     paths = {0: ""}
                     for (eid, _d, pid, name, is_dir, size, mtime, ext, title, bdate, btime,
-                         channel, detail) in self.conn.execute(
+                         channel, detail, note) in self.conn.execute(
                             f"{SELECT_ROWS} WHERE e.disk_id=? ORDER BY e.id", (d,)):
                         base = paths.get(pid, "")
                         p = f"{base}\\{name}" if base else name
@@ -1117,7 +1179,7 @@ class App(tk.Tk):
                         w.writerow([dname, p, "フォルダ" if is_dir else "ファイル", ext,
                                     size, fmt_size(size), fmt_time(mtime),
                                     title or "", bdate or "", btime or "", channel or "",
-                                    detail or ""])
+                                    detail or "", note or ""])
                         n += 1
             self.var_status.set(f"{n:,} 行を書き出しました: {fn}")
         except OSError as ex:

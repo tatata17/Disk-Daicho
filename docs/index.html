@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ディスク台帳ビューア</title>
+<meta name="description" content="ディスク台帳で書き出したCSVを開いて、ディスクの中身を確認・検索できるページです。ファイルはブラウザの中だけで読み込まれ、どこにも送信されません。">
+<style>
+:root{
+  --bg:#f3f5f8; --panel:#fff; --ink:#1c2430; --sub:#5d6b7c; --line:#dde3ea;
+  --accent:#1f5f99; --accent-ink:#fff; --hover:#eef4fa; --chip:#e8eef5; --dir:#b7791f;
+}
+@media (prefers-color-scheme:dark){
+  :root{ --bg:#12161c; --panel:#1b212a; --ink:#e6ebf1; --sub:#9aa8b8; --line:#2c3541;
+    --accent:#5aa2e0; --accent-ink:#0d1319; --hover:#232c38; --chip:#262f3b; --dir:#e0b060; }
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.6 "Segoe UI","Hiragino Sans","Yu Gothic UI",Meiryo,sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:4px 0 2px}
+.lead{color:var(--sub);margin:0 0 14px;font-size:13px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+button,select,input{font:inherit;color:inherit}
+button{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 12px;cursor:pointer}
+button:hover{background:var(--hover)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+button:disabled{opacity:.45;cursor:default}
+select,input[type=search]{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 9px;min-width:0}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+#drop{border:2px dashed var(--line);border-radius:10px;padding:26px 14px;text-align:center}
+#drop.over{border-color:var(--accent);background:var(--hover)}
+#drop p{margin:0 0 12px}
+.note{color:var(--sub);font-size:12.5px;margin:10px 0 0}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.grow{flex:1 1 180px}
+#diskSel{flex:1 1 220px;font-weight:600}
+#diskInfo{color:var(--sub);font-size:12.5px;margin-top:6px}
+#crumbs{display:flex;flex-wrap:wrap;gap:2px;align-items:center;margin:2px 0 8px;font-size:14px}
+#crumbs button{border:none;background:none;padding:2px 6px;color:var(--accent);border-radius:6px}
+#crumbs button:hover{background:var(--hover)}
+#crumbs .sep{color:var(--sub)}
+#crumbs .cur{padding:2px 6px;font-weight:600}
+#count{color:var(--sub);font-size:12.5px;margin:6px 0}
+#list{border-top:1px solid var(--line)}
+.item{display:flex;gap:10px;padding:8px 6px;border-bottom:1px solid var(--line);align-items:flex-start}
+.item.click{cursor:pointer}
+.item.click:hover{background:var(--hover)}
+.ico{flex:0 0 18px;text-align:center;color:var(--sub);font-size:13px;padding-top:2px}
+.item.dir .ico{color:var(--dir)}
+.body{flex:1 1 auto;min-width:0}
+.name{word-break:break-all}
+.item.dir .name{font-weight:600}
+.meta{color:var(--sub);font-size:12.5px;display:flex;flex-wrap:wrap;gap:2px 12px}
+.memo{font-size:13px;border-left:3px solid var(--dir);padding-left:8px;margin:2px 0;word-break:break-word}
+.loc{color:var(--sub);font-size:12.5px;word-break:break-all}
+.loc button{border:none;background:none;color:var(--accent);padding:0;text-align:left;word-break:break-all}
+.chip{background:var(--chip);border-radius:20px;padding:0 8px;font-size:12px}
+.detail{margin-top:6px;padding:8px 10px;background:var(--chip);border-radius:8px;font-size:13px;white-space:pre-wrap;word-break:break-word}
+.detail b{display:block;margin-bottom:2px}
+#more{display:block;margin:12px auto 0}
+.hide{display:none!important}
+footer{color:var(--sub);font-size:12.5px;text-align:center;padding:8px 0 24px}
+footer a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ディスク台帳ビューア</h1>
+  <p class="lead">ディスク台帳で書き出したCSVを開いて、ディスクの中身を確認・検索できます。</p>
+
+  <div class="panel" id="loadPanel">
+    <div id="drop">
+      <p>ディスク台帳の「保存 → CSVに書き出す」で作ったCSVを選んでください。<br>ここにドロップしても開けます(複数可)。</p>
+      <div class="row" style="justify-content:center">
+        <button class="primary" id="pick">CSVファイルを選ぶ</button>
+        <button id="sample">サンプルで試す</button>
+      </div>
+      <input type="file" id="file" accept=".csv,text/csv" multiple class="hide">
+    </div>
+    <p class="note">ファイルはこのブラウザの中だけで読み込まれます。サーバーなど外部には一切送信されません。ページを閉じると内容は消えます。</p>
+    <p class="note" id="msg" role="status"></p>
+  </div>
+
+  <div class="panel hide" id="viewPanel">
+    <div class="row">
+      <select id="diskSel" aria-label="ディスク"></select>
+      <button id="addBtn">CSVを追加</button>
+      <button id="closeBtn">閉じる</button>
+    </div>
+    <div id="diskInfo"></div>
+  </div>
+
+  <div class="panel hide" id="browsePanel">
+    <div class="row">
+      <input type="search" id="q" class="grow" placeholder="ファイル名・メモ・番組名・チャンネルなどを検索" aria-label="検索">
+      <select id="scope" aria-label="検索範囲"><option value="all">すべてのディスク</option><option value="disk">このディスク</option></select>
+      <select id="type" aria-label="種類"></select>
+      <button class="primary" id="go">検索</button>
+      <button id="clear">解除</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div id="crumbs" class="grow" aria-label="現在の場所"></div>
+      <select id="sort" aria-label="並び順">
+        <option value="name">名前順</option><option value="size">サイズ順</option>
+        <option value="mtime">更新日時順</option><option value="bdate">放送日順</option>
+      </select>
+      <button id="dir" aria-label="昇順・降順を切り替え">昇順</button>
+    </div>
+    <div id="count"></div>
+    <div id="list"></div>
+    <button id="more" class="hide">さらに表示</button>
+  </div>
+
+  <footer>
+    <a href="https://github.com/tatata17/Disk-Daicho">ディスク台帳 (Disk-Daicho)</a> のCSVを見るためのページです。
+  </footer>
+</div>
+
+<script>
+"use strict";
+const TYPES = {
+  "すべての種類": null,
+  "フォルダのみ": "DIR",
+  "動画": "mp4 mkv m2ts ts mts avi mov wmv mpg mpeg m4v webm flv vob rm rmvb asf 3gp dv ogv",
+  "音声": "mp3 wav flac aac m4a ogg opus wma ac3 dts aiff aif ape tak mka w64 thd eac3",
+  "画像": "jpg jpeg png gif bmp tif tiff webp heic avif psd raw cr2 nef arw dng svg ico",
+  "文書": "txt pdf doc docx xls xlsx ppt pptx csv md rtf odt ods html htm epub",
+  "字幕・台本": "srt ass ssa sup vtt sub idx avs vpy",
+  "圧縮": "zip rar 7z lzh tar gz bz2 xz cab",
+  "ディスクイメージ": "iso img bin cue mdf mds nrg vhd vhdx"
+};
+const PAGE = 300;
+
+/* ---------- CSVの読み取り (引用符・セル内改行に対応) ---------- */
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const rows = [];
+  let row = [], i = 0;
+  const n = text.length;
+  while (i < n) {
+    let cell;
+    if (text[i] === '"') {
+      let s = "";
+      i++;
+      for (;;) {
+        const j = text.indexOf('"', i);
+        if (j < 0) { s += text.slice(i); i = n; break; }
+        s += text.slice(i, j);
+        if (text[j + 1] === '"') { s += '"'; i = j + 2; } else { i = j + 1; break; }
+      }
+      cell = s;
+      while (i < n && text[i] !== "," && text[i] !== "\n" && text[i] !== "\r") i++;
+    } else {
+      let j = i;
+      while (j < n && text[j] !== "," && text[j] !== "\n" && text[j] !== "\r") j++;
+      cell = text.slice(i, j);
+      i = j;
+    }
+    row.push(cell);
+    if (i >= n) break;
+    if (text[i] === ",") { i++; if (i >= n) row.push(""); continue; }
+    if (text[i] === "\r" && text[i + 1] === "\n") i++;
+    i++;
+    rows.push(row);
+    row = [];
+  }
+  if (row.length) rows.push(row);
+  return rows;
+}
+
+/* ---------- 台帳データの組み立て ---------- */
+function newModel() { return { disks: new Map() }; }
+
+function getDisk(model, name) {
+  let d = model.disks.get(name);
+  if (!d) {
+    d = { name, root: { n: name, p: null, d: true, c: [], s: 0, m: "", e: "", pi: null },
+          dirs: new Map(), all: [], files: 0, folders: 0 };
+    d.root.disk = d;
+    d.dirs.set("", d.root);
+    model.disks.set(name, d);
+  }
+  return d;
+}
+
+function getDir(disk, path) {
+  let node = disk.dirs.get(path);
+  if (node) return node;
+  const k = path.lastIndexOf("\\");
+  const parent = getDir(disk, k < 0 ? "" : path.slice(0, k));
+  node = { n: k < 0 ? path : path.slice(k + 1), p: parent, d: true, c: [], s: 0, m: "", e: "", pi: null, disk };
+  parent.c.push(node);
+  disk.dirs.set(path, node);
+  disk.all.push(node);
+  disk.folders++;
+  return node;
+}
+
+/* rows を model に足す。足した行数を返す。台帳のCSVでなければ例外。 */
+function addRows(model, rows) {
+  if (!rows.length) throw new Error("空のファイルです。");
+  const head = rows[0].map(s => s.trim());
+  const col = name => head.indexOf(name);
+  const cDisk = col("ディスク"), cPath = col("パス"), cKind = col("種別");
+  if (cDisk < 0 || cPath < 0 || cKind < 0)
+    throw new Error("ディスク台帳で書き出したCSVではないようです(見出しに「ディスク」「パス」「種別」がありません)。");
+  const cExt = col("拡張子"), cSize = col("サイズ(バイト)"), cTime = col("更新日時"),
+        cTitle = col("番組名"), cBdate = col("放送日"), cBtime = col("開始時刻"),
+        cCh = col("チャンネル"), cDetail = col("番組内容"), cNote = col("メモ");
+  const get = (r, c) => (c >= 0 && r[c] !== undefined ? r[c] : "");
+  let count = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const path = get(r, cPath);
+    if (!get(r, cDisk) || !path) continue;
+    const disk = getDisk(model, r[cDisk]);
+    const size = Number(get(r, cSize)) || 0;
+    if (r[cKind] === "フォルダ") {
+      const node = getDir(disk, path);
+      node.s = size;
+      node.m = get(r, cTime);
+      node.note = get(r, cNote);
+    } else {
+      const k = path.lastIndexOf("\\");
+      const parent = getDir(disk, k < 0 ? "" : path.slice(0, k));
+      const title = get(r, cTitle);
+      const node = { n: k < 0 ? path : path.slice(k + 1), p: parent, d: false, c: null, s: size,
+                     m: get(r, cTime), e: get(r, cExt).toLowerCase(), disk, note: get(r, cNote),
+                     pi: title || get(r, cCh) || get(r, cDetail)
+                       ? { title, bdate: get(r, cBdate), btime: get(r, cBtime), ch: get(r, cCh), detail: get(r, cDetail) }
+                       : null };
+      parent.c.push(node);
+      disk.all.push(node);
+      disk.files++;
+    }
+    count++;
+  }
+  for (const d of model.disks.values()) d.root.s = d.root.c.reduce((a, x) => a + x.s, 0);
+  return count;
+}
+
+function nodePath(node) {           // ディスク名を除いた場所
+  const parts = [];
+  for (let x = node; x && x.p; x = x.p) parts.push(x.n);
+  return parts.reverse().join("\\");
+}
+
+function search(model, disks, words, type) {
+  const ws = words.map(w => w.toLowerCase());
+  const exts = type && type !== "DIR" ? new Set(type.split(" ")) : null;
+  const out = [];
+  for (const d of disks) {
+    for (const x of d.all) {
+      if (type === "DIR" ? !x.d : exts ? (x.d || !exts.has(x.e)) : false) continue;
+      if (ws.length) {
+        if (x.lc === undefined)
+          x.lc = (x.n + "\n" + (x.note || "") + (x.pi ? "\n" + x.pi.title + "\n" + x.pi.ch + "\n" + x.pi.detail : "")).toLowerCase();
+        let ok = true;
+        for (const w of ws) if (!x.lc.includes(w)) { ok = false; break; }
+        if (!ok) continue;
+      }
+      out.push(x);
+    }
+  }
+  return out;
+}
+
+function sortNodes(list, key, desc) {
+  const sgn = desc ? -1 : 1;
+  const coll = new Intl.Collator("ja", { numeric: true, sensitivity: "base" });
+  const val = x => key === "size" ? x.s : key === "mtime" ? x.m
+    : key === "bdate" ? (x.pi ? x.pi.bdate + " " + x.pi.btime : "") : x.n;
+  return list.slice().sort((a, b) => {
+    if (a.d !== b.d) return a.d ? -1 : 1;                 // フォルダを先に
+    const va = val(a), vb = val(b);
+    const c = typeof va === "number" ? va - vb : coll.compare(va, vb);
+    return c ? c * sgn : coll.compare(a.n, b.n);
+  });
+}
+
+function fmtSize(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(2) : String(n)) + " " + u[i];
+}
+
+const SAMPLE = [
+  ["ディスク","パス","種別","拡張子","サイズ(バイト)","サイズ","更新日時","番組名","放送日","開始時刻","チャンネル","番組内容","メモ"],
+  ["ポータブルHDD","DISC_0001.iso","ファイル","iso","4294967296","","2026-06-20 15:00","","","","","","家族旅行のビデオをまとめたディスク(架空の例)"],
+  ["外付けHDD①","録画","フォルダ","","5368709120","","2026-10-03 21:10"],
+  ["外付けHDD①","録画\\そらいろ探検隊","フォルダ","","3221225472","","2026-10-03 21:10"],
+  ["外付けHDD①","録画\\そらいろ探検隊\\そらいろ探検隊 第1話,20260905.mkv","ファイル","mkv","1610612736","","2026-09-05 19:40","そらいろ探検隊 第1話","2026/09/05","18:30:00","サンプル放送","空に浮かぶ島を目指して、三人の旅が始まる。\n(これは架空の番組です)"],
+  ["外付けHDD①","録画\\そらいろ探検隊\\そらいろ探検隊 第1話,20260905.csv","ファイル","csv","2048","","2026-09-05 19:40"],
+  ["外付けHDD①","録画\\そらいろ探検隊\\そらいろ探検隊 第2話,20260912.mkv","ファイル","mkv","1610610688","","2026-09-12 19:41","そらいろ探検隊 第2話","2026/09/12","18:30:00","サンプル放送","風の谷で見つけた古い地図の謎。\n(これは架空の番組です)"],
+  ["外付けHDD①","録画\\夜ふかし天文台,20261003.mkv","ファイル","mkv","2147483648","","2026-10-03 21:10","夜ふかし天文台","2026/10/03","20:00:00","テストチャンネル","秋の星座をゆっくり眺める一時間。(架空の番組です)"],
+  ["外付けHDD①","写真","フォルダ","","7340032","","2026-08-14 10:02"],
+  ["外付けHDD①","写真\\夏の旅行_001.jpg","ファイル","jpg","3145728","","2026-08-14 10:01"],
+  ["外付けHDD①","写真\\夏の旅行_002.jpg","ファイル","jpg","4194304","","2026-08-14 10:02"],
+  ["ポータブルHDD","音楽","フォルダ","","52428800","","2026-07-01 08:00"],
+  ["ポータブルHDD","音楽\\サンプル曲集.flac","ファイル","flac","52428800","","2026-07-01 08:00"],
+  ["ポータブルHDD","メモ.txt","ファイル","txt","1200","","2026-11-02 12:34"]
+];
+
+/* ---------- 画面 ---------- */
+if (typeof document !== "undefined") (function () {
+  const $ = id => document.getElementById(id);
+  let model = newModel();
+  let curDisk = null, curNode = null, results = null, shown = PAGE, view = [];
+
+  for (const k of Object.keys(TYPES)) $("type").add(new Option(k, k));
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  async function loadFiles(files) {
+    const msgs = [];
+    for (const f of files) {
+      try {
+        $("msg").textContent = `${f.name} を読み込み中…`;
+        await new Promise(r => setTimeout(r, 30));
+        const n = addRows(model, parseCSV(await f.text()));
+        msgs.push(`${f.name}: ${n.toLocaleString()} 件`);
+      } catch (e) {
+        msgs.push(`${f.name}: 読めませんでした。${e.message}`);
+      }
+    }
+    $("msg").textContent = msgs.join(" / ");
+    afterLoad();
+  }
+
+  function afterLoad() {
+    if (!model.disks.size) return;
+    const sel = $("diskSel");
+    const keep = curDisk && curDisk.name;
+    sel.textContent = "";
+    for (const d of model.disks.values()) sel.add(new Option(d.name, d.name));
+    $("viewPanel").classList.remove("hide");
+    $("browsePanel").classList.remove("hide");
+    $("drop").classList.add("hide");
+    openDisk(model.disks.get(keep) || model.disks.values().next().value);
+  }
+
+  function openDisk(d, node) {
+    curDisk = d;
+    curNode = node || d.root;
+    results = null;
+    $("diskSel").value = d.name;
+    $("diskInfo").textContent =
+      `フォルダ ${d.folders.toLocaleString()} / ファイル ${d.files.toLocaleString()} / 合計 ${fmtSize(d.root.s)}`
+      + (model.disks.size > 1 ? `　(読み込んだディスク ${model.disks.size} 台)` : "");
+    render();
+  }
+
+  function goto(node) {
+    if (node.disk !== curDisk) { openDisk(node.disk, node); return; }
+    curNode = node;
+    results = null;
+    render();
+    window.scrollTo({ top: $("browsePanel").offsetTop - 8 });
+  }
+
+  function renderCrumbs() {
+    const box = $("crumbs");
+    box.textContent = "";
+    if (results) {
+      box.append(el("span", "cur", `検索結果: ${$("q").value.trim() || $("type").value}`));
+      return;
+    }
+    const chain = [];
+    for (let x = curNode; x; x = x.p) chain.push(x);
+    chain.reverse().forEach((x, i) => {
+      if (i) box.append(el("span", "sep", "›"));
+      if (x === curNode) box.append(el("span", "cur", x.n));
+      else { const b = el("button", "", x.n); b.onclick = () => goto(x); box.append(b); }
+    });
+  }
+
+  function render() {
+    renderCrumbs();
+    view = sortNodes(results || curNode.c, $("sort").value, $("dir").dataset.desc === "1");
+    shown = PAGE;
+    $("list").textContent = "";
+    appendRows(0);
+  }
+
+  function appendRows(from) {
+    const list = $("list");
+    const to = Math.min(view.length, shown);
+    const frag = document.createDocumentFragment();
+    if (!results && curNode.p && from === 0) {
+      const up = el("div", "item dir click");
+      up.append(el("div", "ico", "↑"), el("div", "body", "上のフォルダへ"));
+      up.onclick = () => goto(curNode.p);
+      frag.append(up);
+    }
+    for (let i = from; i < to; i++) frag.append(rowOf(view[i]));
+    list.append(frag);
+    $("count").textContent = view.length
+      ? `${view.length.toLocaleString()} 件` + (to < view.length ? ` (うち ${to.toLocaleString()} 件を表示)` : "")
+      : (results ? "見つかりませんでした。" : "このフォルダは空です(または中身が記録されていません)。");
+    $("more").classList.toggle("hide", to >= view.length);
+  }
+
+  function rowOf(x) {
+    const row = el("div", "item" + (x.d ? " dir click" : x.pi ? " click" : ""));
+    row.append(el("div", "ico", x.d ? "■" : "・"));
+    const body = el("div", "body");
+    body.append(el("div", "name", x.n));
+    if (x.note) body.append(el("div", "memo", "メモ: " + x.note));
+    const meta = el("div", "meta");
+    meta.append(el("span", "", fmtSize(x.s)));
+    if (x.m) meta.append(el("span", "", x.m));
+    if (x.pi) {
+      const when = (x.pi.bdate + " " + x.pi.btime).trim();
+      if (when) meta.append(el("span", "chip", "放送 " + when));
+      if (x.pi.ch) meta.append(el("span", "chip", x.pi.ch));
+    }
+    body.append(meta);
+    if (results) {
+      const loc = el("div", "loc");
+      const b = el("button", "", "場所: " + x.disk.name + "\\" + nodePath(x.p));
+      b.onclick = ev => { ev.stopPropagation(); goto(x.p); };
+      loc.append(b);
+      body.append(loc);
+    }
+    row.append(body);
+    if (x.d) row.onclick = () => goto(x);
+    else if (x.pi) row.onclick = () => {
+      const old = body.querySelector(".detail");
+      if (old) { old.remove(); return; }
+      const d = el("div", "detail");
+      d.append(el("b", "", x.pi.title || x.n), document.createTextNode(x.pi.detail || "(番組内容の記録はありません)"));
+      body.append(d);
+    };
+    return row;
+  }
+
+  function doSearch() {
+    const words = $("q").value.trim().split(/\s+/).filter(Boolean);
+    const type = TYPES[$("type").value];
+    if (!words.length && !type) { clearSearch(); return; }
+    const disks = $("scope").value === "disk" ? [curDisk] : [...model.disks.values()];
+    results = search(model, disks, words, type);
+    render();
+  }
+
+  function clearSearch() {
+    $("q").value = "";
+    $("type").selectedIndex = 0;
+    results = null;
+    render();
+  }
+
+  $("pick").onclick = $("addBtn").onclick = () => $("file").click();
+  $("file").onchange = e => { loadFiles([...e.target.files]); e.target.value = ""; };
+  $("sample").onclick = () => { addRows(model, SAMPLE); $("msg").textContent = "サンプル(架空のデータ)を表示しています。"; afterLoad(); };
+  $("closeBtn").onclick = () => {
+    model = newModel(); curDisk = curNode = results = null;
+    $("viewPanel").classList.add("hide"); $("browsePanel").classList.add("hide");
+    $("drop").classList.remove("hide"); $("msg").textContent = "";
+  };
+  $("diskSel").onchange = e => openDisk(model.disks.get(e.target.value));
+  $("go").onclick = doSearch;
+  $("clear").onclick = clearSearch;
+  $("q").onkeydown = e => { if (e.key === "Enter") doSearch(); };
+  $("type").onchange = doSearch;
+  $("sort").onchange = render;
+  $("dir").onclick = () => {
+    const b = $("dir");
+    b.dataset.desc = b.dataset.desc === "1" ? "0" : "1";
+    b.textContent = b.dataset.desc === "1" ? "降順" : "昇順";
+    render();
+  };
+  $("more").onclick = () => { const from = shown; shown += PAGE; appendRows(from); };
+
+  const drop = $("drop");
+  ["dragenter", "dragover"].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
+  document.addEventListener("drop", e => {
+    const fs = [...(e.dataTransfer ? e.dataTransfer.files : [])];
+    if (fs.length) loadFiles(fs);
+  });
+})();
+
+if (typeof module !== "undefined") module.exports = { parseCSV, newModel, addRows, search, sortNodes, nodePath, fmtSize, SAMPLE, TYPES };
+</script>
+</body>
+</html>
