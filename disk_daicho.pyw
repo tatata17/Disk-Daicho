@@ -7,6 +7,7 @@
 ・m2ts-encoder が動画と同名で出力する番組情報csv(rplsinfoの出力)も読み取り、
   番組名・放送日・チャンネル・番組内容を一緒に記録して検索できる
 ・ファイルやフォルダごとにメモを書ける (名前を付け直していないisoなどに「これは何のファイルか」を残せる)
+・専用のアイコン付き。タスクバーでも他のpywとは別のアイコンとして並ぶ
 ・標準ライブラリのみで動作 (Python 3.8 以降 / Windows 想定)
 ・記録データはこのファイルと同じフォルダの disk_daicho.db (SQLite) に保存
 """
@@ -371,11 +372,165 @@ SELECT_ROWS = ("SELECT e.id,e.disk_id,e.parent_id,e.name,e.is_dir,e.size,e.mtime
                "LEFT JOIN notes nt ON nt.entry_id=e.id")
 
 
+# ---------------------------------------------------------------- アイコン
+# タスクバーで他のpyw(m2ts-encoderなど)とまとめられないようにする、このアプリ専用のID
+TASKBAR_APP_ID = "tatata17.disk-daicho"
+
+# ウインドウとタスクバーに使うアイコン(64x64のPNG)。ディスク+目録の行
+APP_ICON_PNG_B64 = (
+    "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"
+)
+
+
+def set_taskbar_identity() -> str:
+    """
+    Windowsのタスクバーは、同じpython.exeで動く窓を1つのアイコンにまとめてしまう。
+    このアプリ専用のID(AppUserModelID)を、プロセスに付けて、他のpywとは別のアイコンとして表示させる。
+    戻り値は結果の説明(ログ用)。
+    """
+    if sys.platform != "win32":
+        return "Windows以外"
+    try:
+        import ctypes
+        func = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        func.argtypes = [ctypes.c_wchar_p]
+        func.restype = ctypes.c_long
+        hr = func(TASKBAR_APP_ID)
+        return "プロセスにID設定 " + ("成功" if hr == 0 else f"失敗(0x{hr & 0xFFFFFFFF:08X})")
+    except Exception as e:  # noqa: BLE001
+        return f"プロセスにID設定 例外({e})"
+
+
+def set_window_taskbar_identity(tk_window) -> str:
+    """
+    ウインドウ自体にもIDを付ける(プロセスのIDだけでは分かれない環境の保険)。
+    SHGetPropertyStoreForWindow で PKEY_AppUserModel_ID を書く。結果の説明を返す。
+    """
+    if sys.platform != "win32":
+        return "Windows以外"
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort), ("Data3", ctypes.c_ushort),
+                        ("Data4", ctypes.c_ubyte * 8)]
+
+        def make_guid(text: str) -> GUID:
+            import uuid
+            u = uuid.UUID(text)
+            g = GUID()
+            g.Data1, g.Data2, g.Data3 = u.time_low, u.time_mid, u.time_hi_version
+            for i, b in enumerate(u.bytes[8:]):
+                g.Data4[i] = b
+            return g
+
+        class PROPERTYKEY(ctypes.Structure):
+            _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+        class PROPVARIANT(ctypes.Structure):
+            _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort),
+                        ("r3", ctypes.c_ushort), ("ptr", ctypes.c_void_p), ("pad", ctypes.c_void_p)]
+
+        tk_window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(tk_window.winfo_id()) or tk_window.winfo_id()
+        iid = make_guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")   # IID_IPropertyStore
+        store = ctypes.c_void_p()
+        get_store = ctypes.windll.shell32.SHGetPropertyStoreForWindow
+        get_store.argtypes = [wintypes.HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+        get_store.restype = ctypes.c_long
+        hr = get_store(hwnd, ctypes.byref(iid), ctypes.byref(store))
+        if hr != 0 or not store.value:
+            return f"ウインドウにID設定 失敗(0x{hr & 0xFFFFFFFF:08X})"
+        text = ctypes.create_unicode_buffer(TASKBAR_APP_ID)
+        pv = PROPVARIANT()
+        pv.vt = 31   # VT_LPWSTR
+        pv.ptr = ctypes.cast(text, ctypes.c_void_p).value
+        key = PROPERTYKEY(make_guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5)   # PKEY_AppUserModel_ID
+        vtbl = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        set_value = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY),
+                                       ctypes.POINTER(PROPVARIANT))(vtbl[6])
+        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
+        hr = set_value(store, ctypes.byref(key), ctypes.byref(pv))
+        release(store)
+        return "ウインドウにID設定 " + ("成功" if hr == 0 else f"失敗(0x{hr & 0xFFFFFFFF:08X})")
+    except Exception as e:  # noqa: BLE001
+        return f"ウインドウにID設定 例外({e})"
+
+
 # ---------------------------------------------------------------- 画面
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
+        try:
+            self._app_icon = tk.PhotoImage(data=APP_ICON_PNG_B64)
+            self.iconphoto(True, self._app_icon)  # True: 入力ダイアログなどにも同じアイコン
+        except tk.TclError:
+            pass
         self.geometry("1180x760")
         self.minsize(960, 600)
         self.conn = connect()
@@ -1210,7 +1365,10 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:  # noqa: BLE001
             pass
-    App().mainloop()
+    set_taskbar_identity()
+    app = App()
+    set_window_taskbar_identity(app)
+    app.mainloop()
 
 
 if __name__ == "__main__":
