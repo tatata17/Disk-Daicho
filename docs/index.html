@@ -59,6 +59,7 @@ select,input[type=search]{border:1px solid var(--line);background:var(--panel);b
 .memo{font-size:13px;border-left:3px solid var(--dir);padding-left:8px;margin:2px 0;word-break:break-word}
 .loc{color:var(--sub);font-size:12.5px;word-break:break-all}
 .loc button{border:none;background:none;color:var(--accent);padding:0;text-align:left;word-break:break-all}
+.chip.has{background:var(--accent);color:var(--accent-ink);white-space:nowrap;font-weight:400}
 .chip{background:var(--chip);border-radius:20px;padding:0 8px;font-size:12px}
 .detail{margin-top:6px;padding:8px 10px;background:var(--chip);border-radius:8px;font-size:13px;white-space:pre-wrap;word-break:break-word}
 .detail b{display:block;margin-bottom:2px}
@@ -427,7 +428,9 @@ if (typeof document !== "undefined") (function () {
     const row = el("div", "item" + (x.d ? " dir click" : x.pi ? " click" : ""));
     row.append(el("div", "ico", x.d ? "■" : "・"));
     const body = el("div", "body");
-    body.append(el("div", "name", x.n));
+    const name = el("div", "name", x.n);
+    if (x.pi) name.append(" ", el("span", "chip has", "番組情報あり"));
+    body.append(name);
     if (x.note) body.append(el("div", "memo", "メモ: " + x.note));
     const meta = el("div", "meta");
     meta.append(el("span", "", fmtSize(x.s)));

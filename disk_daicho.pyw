@@ -31,7 +31,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.1"
+APP_VERSION = "2026.11.21.2"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
 UPDATE_COMMIT_API = "https://api.github.com/repos/tatata17/Disk-Daicho/commits/main"
@@ -1305,7 +1305,8 @@ class App(tk.Tk):
                 if disk_id not in names:
                     names[disk_id] = self.disk_row(disk_id)[0]
                 loc = f"{names[disk_id]}\\{self.path_of(pid)}"
-            self.tree.insert("", "end", iid=str(eid), text=("■ " if is_dir else "　 ") + name,
+            self.tree.insert("", "end", iid=str(eid), text=("■ " if is_dir else "　 ") + name
+                             + ("　［番組情報あり］" if title is not None else ""),
                              values=((note or "").replace("\n", " "), fmt_size(size), fmt_time(mtime),
                                      "フォルダ" if is_dir else ext,
                                      f"{bdate or ''} {btime or ''}".strip(), channel or "", loc))
