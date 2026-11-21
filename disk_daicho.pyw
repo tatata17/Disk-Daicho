@@ -27,11 +27,13 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
+import webbrowser
 from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.3"
+APP_VERSION = "2026.11.21.4"
+VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
 UPDATE_COMMIT_API = "https://api.github.com/repos/tatata17/Disk-Daicho/commits/main"
@@ -714,6 +716,7 @@ class App(tk.Tk):
             command=lambda: self.set_setting("auto_update_check",
                                              "1" if self.auto_update_var.get() else "0"))
         self._help_menu.add_separator()
+        self._help_menu.add_command(label="ビューアのサイトを開く", command=self.open_viewer)
         self._help_menu.add_command(label="バージョン情報", command=lambda: messagebox.showinfo(
             "バージョン情報", f"{APP_NAME}\nバージョン {APP_VERSION}\n\n"
             "配布元: https://github.com/tatata17/Disk-Daicho", parent=self))
@@ -887,6 +890,8 @@ class App(tk.Tk):
         m = tk.Menu(mb, tearoff=0)
         m.add_command(label="選択中のディスクをCSVに書き出す", command=lambda: self.export_csv(False))
         m.add_command(label="すべてのディスクをCSVに書き出す", command=lambda: self.export_csv(True))
+        m.add_command(label="ビューアのサイトを開く (書き出したCSVをブラウザで見る)",
+                      command=self.open_viewer)
         m.add_separator()
         m.add_command(label="記録データ(DB)をバックアップ", command=self.backup_db)
         mb["menu"] = m
@@ -904,6 +909,7 @@ class App(tk.Tk):
         bf.pack(fill="x")
         ttk.Button(bf, text="↑ 上へ", command=lambda: self.move_disk(-1)).pack(side="left", expand=True, fill="x")
         ttk.Button(bf, text="↓ 下へ", command=lambda: self.move_disk(1)).pack(side="left", expand=True, fill="x")
+        ttk.Button(left, text="ビューアのサイトを開く", command=self.open_viewer).pack(fill="x", pady=(6, 0))
 
         # ---- 右: 中身
         right = ttk.Frame(pw, padding=4)
@@ -1605,6 +1611,14 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"書き出しに失敗しました。\n{ex}")
         finally:
             self.configure(cursor="")
+
+    def open_viewer(self):
+        """書き出したCSVを見るためのページを、既定のブラウザで開く(ページを開くだけで、何も送信しない)"""
+        try:
+            webbrowser.open(VIEWER_URL)
+            self.var_status.set("ブラウザでビューアを開きました。「保存 → CSVに書き出す」で作ったCSVを選んでください。")
+        except Exception as ex:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"ブラウザを開けませんでした。\n{VIEWER_URL}\n\n{ex}")
 
     def backup_db(self):
         fn = filedialog.asksaveasfilename(
