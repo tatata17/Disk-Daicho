@@ -33,7 +33,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.21.8"
+APP_VERSION = "2026.11.22.1"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -848,6 +848,106 @@ def set_window_taskbar_identity(tk_window) -> str:
 
 
 # ---------------------------------------------------------------- 画面
+# ---------------------------------------------------------------- ツールチップ
+TOOLTIP_DELAY_MS = 1500  # マウスを置いてから説明が出るまでの時間(ミリ秒)
+
+# ボタンなどの表示名 → 説明。画面を作ったあと、表示名が合う部品にまとめて付ける
+TOOLTIP_TEXTS = {
+    "検索": "入力した言葉で探します。空白で区切ると、すべてを含むものだけに絞ります。Enterキーでも検索できます。",
+    "解除": "検索をやめて、元のフォルダの表示に戻します。検索欄と種類の絞り込みも空に戻ります。",
+    "再読込": "いま繋がっているドライブを調べ直します。HDDを繋いだり外したりしたあとに押してください。",
+    "フォルダ指定…": "ドライブ全体ではなく、フォルダを1つ選んで記録します。",
+    "記録する": "選んだディスクの中身(フォルダとファイルの名前・サイズ・日時)を台帳に記録します。"
+                "ディスクのファイルは読むだけで、書き換えたり消したりしません。記録済みのディスクなら、今の内容に更新できます。",
+    "中止": "記録を途中でやめます。途中まで読んだ分は保存されず、前の記録がそのまま残ります。",
+    "動画と同名のcsv(m2ts-encoderの番組情報)を読み取る":
+        "動画と同じ名前のcsvがあれば、番組名・放送日・チャンネル・番組内容を読み取って、動画と一緒に記録します。"
+        "読み取ったcsvは一覧には出しません(ディスク上のcsvはそのままです)。",
+    "保存 ▾": "CSVへの書き出し、ビューアのサイトを開く、記録データのバックアップ。",
+    "↑ 上へ": "選んでいるディスクを、一覧の中で1つ上へ動かします。",
+    "↓ 下へ": "選んでいるディスクを、一覧の中で1つ下へ動かします。",
+    "ビューアのサイトを開く": "書き出したCSVをブラウザで見るページを開きます(スマホでも見られます)。"
+                              "ページを開くだけで、CSVや記録データが送られることはありません。",
+    "名前変更": "このディスクに付けた名前を変えます。台帳の中の名前だけで、ディスク本体は変わりません。",
+    "記録を削除": "このディスクの記録を台帳から消します。ディスク本体のファイルには触れません。",
+    "← 戻る": "直前に見ていたフォルダへ戻ります。(Alt + ←)",
+    "↑ 上の階層へ": "1つ上のフォルダへ移ります。(Alt + ↑、一覧の上では BackSpace でも)",
+    "メモを書く…": "選んでいるファイルやフォルダに、メモを書きます。検索にもヒットします。"
+                   "台帳に書くだけで、ディスクのファイルには何も書き込みません。",
+    "前へ": "前の 1000 件を表示します。",
+    "次へ": "次の 1000 件を表示します(一覧は 1000 件ずつ表示します)。",
+    "今の内容で更新": "このディスクを、今の中身で記録し直します。"
+                      "名前・記録範囲・階層・csvの読み取りは、前回の記録と同じにします。終わると、前回との差を表示します。",
+}
+
+
+class Tooltip:
+    """マウスを置いてしばらくすると説明を出す(ほかのソフトによくあるアレ)"""
+
+    def __init__(self, widget, text, delay=TOOLTIP_DELAY_MS):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._job = None
+        self._tip = None
+        widget._tooltip = self
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        try:
+            self._job = self.widget.after(self.delay, self._show)
+        except tk.TclError:
+            self._job = None
+
+    def _cancel(self):
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+
+    def _show(self):
+        self._job = None
+        if self._tip is not None:
+            return
+        try:
+            x = self.widget.winfo_pointerx() + 14
+            y = self.widget.winfo_pointery() + 18
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            try:
+                tip.wm_attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            tk.Label(
+                tip, text=self.text, justify="left", wraplength=380, background="#ffffe1",
+                foreground="#000000", relief="solid", borderwidth=1, padx=6, pady=4,
+            ).pack()
+            tip.update_idletasks()
+            w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+            x = max(0, min(x, tip.winfo_screenwidth() - w - 4))
+            if y + h > tip.winfo_screenheight() - 4:
+                y = self.widget.winfo_pointery() - h - 10
+            tip.wm_geometry(f"+{x}+{max(0, y)}")
+            self._tip = tip
+        except tk.TclError:
+            self._tip = None
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -877,6 +977,7 @@ class App(tk.Tk):
         self.note_info = {}
         self.path_cache = {}
         self._build()
+        self._attach_tooltips()
         self.reload_drives()
         self.refresh_disks()
         self.after(100, self._poll)
@@ -1275,6 +1376,37 @@ class App(tk.Tk):
         save_rec_options(self.conn, self._rec_options())
         self._update_rec_summary()
 
+    def _attach_tooltips(self):
+        """画面の部品に説明(ツールチップ)を付ける。ボタン類は表示名で、入力欄などは個別に"""
+        def walk(w):
+            yield w
+            for child in w.winfo_children():
+                yield from walk(child)
+
+        for w in walk(self):
+            if isinstance(w, (ttk.Button, ttk.Menubutton, ttk.Checkbutton)) and not hasattr(w, "_tooltip"):
+                text = TOOLTIP_TEXTS.get(str(w.cget("text")))
+                if text:
+                    Tooltip(w, text)
+            elif isinstance(w, ttk.Entry) and str(w.cget("textvariable")) == str(self.var_name):
+                Tooltip(w, "このディスクに付ける名前(例: 動画保管01)。一覧や検索結果に、この名前で出ます。"
+                           "記録済みのディスクを選ぶと、前の名前が入ります。")
+        for w, text in (
+            (self.ent_q, "ファイル名・フォルダ名のほか、メモ・番組名・チャンネル・番組内容からも探します。"
+                         "空白で区切ると絞り込めます。Enterで検索、↓で一覧へ。(Ctrl + F でここに移れます)"),
+            (self.cmb_where, "探す範囲。「このディスク」は左で選んでいるディスクだけ、"
+                             "「すべてのディスク」は記録した全部から探します。"),
+            (self.cmb_type, "種類で絞り込みます。言葉を入れずに、種類だけで検索することもできます。"),
+            (self.cmb_drive, "記録するドライブを選びます。「★記録済」と出るものは、前に記録したディスクです"
+                             "(ドライブ文字が変わっていても分かります)。"),
+            (self.lbl_adv, "クリックで開閉します。記録範囲・階層・csvの読み取りを変えられます。"
+                           "今の設定は、畳んでいてもこの行に出ています。次に起動したときも同じ設定です。"),
+            (self.cmb_scope, "「フォルダのみ」にすると、ファイルは記録せず、フォルダの名前と合計サイズだけを記録します。"),
+            (self.cmb_depth, "「階層を指定」にすると、深いフォルダの中までは記録しません。"),
+            (self.spn_depth, "何階層目まで記録するか。ディスク直下が1階層目です。"),
+        ):
+            Tooltip(w, text)
+
     def _toggle_adv(self, _e=None):
         self.adv_open = not self.adv_open
         if self.adv_open:
@@ -1308,6 +1440,7 @@ class App(tk.Tk):
             btn = ttk.Button(row, text="今の内容で更新",
                              command=lambda d=disk_id, p=path: self.quick_update(d, p))
             btn.pack(side="right")
+            Tooltip(btn, TOOLTIP_TEXTS["今の内容で更新"])
             if self.scanning:
                 btn.configure(state="disabled")
             self.banner_buttons.append(btn)
