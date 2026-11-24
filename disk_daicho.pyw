@@ -33,7 +33,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.22.1"
+APP_VERSION = "2026.11.25.1"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -459,6 +459,90 @@ def fmt_diff(diff):
             f"合計 {fmt_delta(delta)}" + (" (フォルダで比較)" if dirs_only else ""))
 
 
+# ---------------------------------------------------------------- CSV書き出し(隠す設定つき)
+CSV_HEADER = ["ディスク", "パス", "種別", "拡張子", "サイズ(バイト)", "サイズ", "更新日時",
+              "番組名", "放送日", "開始時刻", "チャンネル", "番組内容", "メモ"]
+
+
+def relink_paths(cur, table, old_disk, new_disk):
+    """
+    メモ(notes)や隠す設定(hidden)は「ディスク内のパス」で覚えている。記録し直したとき、同じ場所の
+    ファイル・フォルダに付け直す。見つからない(移動・改名・削除された)ものも消さずに残し、
+    次に見つかったとき付け直す。見つからなかったパスの一覧を返す。
+    """
+    lost = []
+    for rid, path in cur.execute(f"SELECT id,path FROM {table} WHERE disk_id=?", (old_disk,)).fetchall():
+        eid, parent = None, 0
+        for part in path.split("\\"):
+            r = cur.execute("SELECT id FROM entries WHERE disk_id=? AND parent_id=? AND name=?",
+                            (new_disk, parent, part)).fetchone()
+            if not r:
+                eid = None
+                break
+            eid = parent = r[0]
+        if eid is None:
+            lost.append(path)
+        cur.execute(f"UPDATE {table} SET disk_id=?,entry_id=? WHERE id=?", (new_disk, eid, rid))
+    return lost
+
+
+def hidden_marks(conn, disk_ids):
+    """隠す設定の一覧 [(ディスクid, パス, 付いている行のid または None)]。None は、今の記録に場所が見つからないもの"""
+    if not disk_ids:
+        return []
+    marks = ",".join("?" * len(disk_ids))
+    return conn.execute(f"SELECT disk_id,path,entry_id FROM hidden WHERE disk_id IN ({marks}) "
+                        "ORDER BY disk_id,path", list(disk_ids)).fetchall()
+
+
+def export_rows(conn, disk_id, disk_name, hide=True, stats=None):
+    """
+    CSVの1行ずつを返す。hide=True のときは、隠す設定のファイル・フォルダと、その中身をすべて除く。
+    除いた分のサイズは、上のフォルダの合計からも引く(合計と中身が合わないと、何か隠していることが
+    分かってしまうため)。stats を渡すと、除いた行数を stats["skipped"] に入れる。
+    """
+    hidden = set()
+    if hide:
+        hidden = {r[0] for r in conn.execute(
+            "SELECT entry_id FROM hidden WHERE disk_id=? AND entry_id IS NOT NULL", (disk_id,))}
+    minus = {}
+    if hidden:
+        parent = dict(conn.execute("SELECT id,parent_id FROM entries WHERE disk_id=? AND is_dir=1",
+                                   (disk_id,)))
+        marks = ",".join("?" * len(hidden))
+        for eid, pid, size in conn.execute(
+                f"SELECT id,parent_id,size FROM entries WHERE id IN ({marks})", list(hidden)).fetchall():
+            chain, x = [], pid
+            while x:
+                chain.append(x)
+                x = parent.get(x, 0)
+            if any(a in hidden for a in chain):
+                continue  # もっと上のフォルダごと隠している。二重に引かない
+            for a in chain:
+                minus[a] = minus.get(a, 0) + (size or 0)
+    paths = {0: ""}
+    gone = set()   # 隠したフォルダ(その中身も除く)
+    skipped = 0
+    for (eid, _d, pid, name, is_dir, size, mtime, ext, title, bdate, btime,
+         channel, detail, note) in conn.execute(f"{SELECT_ROWS} WHERE e.disk_id=? ORDER BY e.id",
+                                                (disk_id,)):
+        if eid in hidden or pid in gone:
+            if is_dir:
+                gone.add(eid)
+            skipped += 1
+            continue
+        base = paths.get(pid, "")
+        path = f"{base}\\{name}" if base else name
+        if is_dir:
+            paths[eid] = path
+            size = max(0, (size or 0) - minus.get(eid, 0))
+        yield [disk_name, path, "フォルダ" if is_dir else "ファイル", ext, size, fmt_size(size),
+               fmt_time(mtime), title or "", bdate or "", btime or "", channel or "",
+               detail or "", note or ""]
+    if stats is not None:
+        stats["skipped"] = stats.get("skipped", 0) + skipped
+
+
 def parse_sidecar_csv(path):
     """
     m2ts-encoder のバッチが作る番組情報csv (UTF-16・タブ区切り、1行目が
@@ -522,6 +606,9 @@ CREATE TABLE IF NOT EXISTS notes(
     id INTEGER PRIMARY KEY, disk_id INTEGER NOT NULL, path TEXT NOT NULL,
     entry_id INTEGER, note TEXT);
 CREATE INDEX IF NOT EXISTS idx_notes_entry ON notes(entry_id);
+CREATE TABLE IF NOT EXISTS hidden(
+    id INTEGER PRIMARY KEY, disk_id INTEGER NOT NULL, path TEXT NOT NULL, entry_id INTEGER);
+CREATE INDEX IF NOT EXISTS idx_hidden_entry ON hidden(entry_id);
 """
 
 
@@ -561,6 +648,7 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
         dir_parent = {}
         n_files = n_dirs = n_skipped = n_info = 0
         diff = None
+        lost_hidden = []   # 記録し直して、隠す設定の場所が見つからなくなったもの
         rows = []
         prog_rows = []
         stack = [(root, 0, 1)]
@@ -662,20 +750,11 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
                 diff = diff_entries(entry_paths(cur, replace_id, dirs_only),
                                     entry_paths(cur, disk_id, dirs_only)) + \
                     (dir_size[0] - (prev[1] or 0), dirs_only)
-            # メモは「ディスク内のパス」で覚えているので、記録し直しても同じ場所のファイルに付け直す。
-            # 見つからない(移動・改名・削除された)メモも消さずに残し、次に見つかったとき付け直す。
-            for nid, npath in cur.execute("SELECT id,path FROM notes WHERE disk_id=?",
-                                          (replace_id,)).fetchall():
-                eid, parent = None, 0
-                for part in npath.split("\\"):
-                    r = cur.execute("SELECT id FROM entries WHERE disk_id=? AND parent_id=? "
-                                    "AND name=?", (disk_id, parent, part)).fetchone()
-                    if not r:
-                        eid = None
-                        break
-                    eid = parent = r[0]
-                cur.execute("UPDATE notes SET disk_id=?,entry_id=? WHERE id=?",
-                            (disk_id, eid, nid))
+            # メモと隠す設定は「ディスク内のパス」で覚えているので、同じ場所のものに付け直す
+            relink_paths(cur, "notes", replace_id, disk_id)
+            had = {r[0] for r in cur.execute(
+                "SELECT path FROM hidden WHERE disk_id=? AND entry_id IS NOT NULL", (replace_id,))}
+            lost_hidden = [x for x in relink_paths(cur, "hidden", replace_id, disk_id) if x in had]
             cur.execute("DELETE FROM entries WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM programs WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM disks WHERE id=?", (replace_id,))
@@ -684,7 +763,7 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
         cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
                     (f"info_csv_{disk_id}", "1" if read_info else "0"))
         conn.commit()
-        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info, diff))
+        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info, diff, lost_hidden))
     except Exception as ex:  # noqa: BLE001
         conn.rollback()
         q.put(("error", f"{type(ex).__name__}: {ex}"))
@@ -874,6 +953,8 @@ TOOLTIP_TEXTS = {
     "↑ 上の階層へ": "1つ上のフォルダへ移ります。(Alt + ↑、一覧の上では BackSpace でも)",
     "メモを書く…": "選んでいるファイルやフォルダに、メモを書きます。検索にもヒットします。"
                    "台帳に書くだけで、ディスクのファイルには何も書き込みません。",
+    "CSVで隠す／戻す": "選んでいるファイルやフォルダを、人に渡すCSVに出さないようにします(フォルダは中身ごと)。"
+                       "もう一度押すと元に戻します。このソフトの画面では、今までどおり見えます。",
     "前へ": "前の 1000 件を表示します。",
     "次へ": "次の 1000 件を表示します(一覧は 1000 件ずつ表示します)。",
     "今の内容で更新": "このディスクを、今の中身で記録し直します。"
@@ -976,6 +1057,8 @@ class App(tk.Tk):
         self.prog_info = {}
         self.note_info = {}
         self.path_cache = {}
+        self._hidden_ids = set()
+        self._hidden_walk = {}
         self._build()
         self._attach_tooltips()
         self.reload_drives()
@@ -1264,6 +1347,7 @@ class App(tk.Tk):
         m.add_command(label="すべてのディスクをCSVに書き出す", command=lambda: self.export_csv(True))
         m.add_command(label="ビューアのサイトを開く (書き出したCSVをブラウザで見る)",
                       command=self.open_viewer)
+        m.add_command(label="CSVで隠す設定の一覧…", command=self.show_hidden_list)
         m.add_separator()
         m.add_command(label="記録データ(DB)をバックアップ", command=self.backup_db)
         mb["menu"] = m
@@ -1335,6 +1419,7 @@ class App(tk.Tk):
         self.menu.add_command(label="このフォルダの場所へ移動", command=self.jump_to_location)
         self.menu.add_separator()
         self.menu.add_command(label="メモを書く…", command=self.edit_note)
+        self.menu.add_command(label="CSVで隠す (人に渡すCSVに出さない)", command=self.toggle_hidden)
 
         r5 = ttk.Frame(right)
         r5.pack(side="bottom", fill="x", pady=(6, 0))
@@ -1348,6 +1433,7 @@ class App(tk.Tk):
         self.btn_prev = ttk.Button(r5, text="前へ", command=lambda: self.turn_page(-1))
         self.btn_prev.pack(side="right", padx=4)
         ttk.Button(r5, text="メモを書く…", command=self.edit_note).pack(side="right", padx=(0, 12))
+        ttk.Button(r5, text="CSVで隠す／戻す", command=self.toggle_hidden).pack(side="right", padx=(0, 4))
         tf.pack(fill="both", expand=True)
 
     # ---------------- 詳細設定(畳む・要約・保存)
@@ -1602,6 +1688,13 @@ class App(tk.Tk):
                     self.var_name.set("")
                     self.refresh_disks(select_id=msg[1])
                     self.reload_drives()
+                    if msg[7]:  # 隠す設定の場所が無くなった。そのままだとCSVに出てしまうので必ず知らせる
+                        shown = "\n".join("　" + x for x in msg[7][:10])
+                        more = f"\n　…ほか {len(msg[7]) - 10} 件" if len(msg[7]) > 10 else ""
+                        messagebox.showwarning(
+                            APP_NAME, "CSVで隠す設定のうち、次の場所が見つからなくなりました。\n"
+                            "名前を変えた・移動した場合、新しい場所は隠す設定になっていません。\n"
+                            f"人に渡すCSVを書き出す前に、設定し直してください。\n\n{shown}{more}", parent=self)
                     if diff and any(diff[:3]):  # 変化があったときは、見落とさないようダイアログでも出す
                         messagebox.showinfo(
                             APP_NAME, f"「{getattr(self, '_scan_name', '')}」を更新しました。\n\n"
@@ -1715,6 +1808,7 @@ class App(tk.Tk):
             self.conn.execute("DELETE FROM entries WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM programs WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM notes WHERE disk_id=?", (self.cur_disk,))
+            self.conn.execute("DELETE FROM hidden WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM settings WHERE key=?", (f"info_csv_{self.cur_disk}",))
             self.conn.execute("DELETE FROM disks WHERE id=?", (self.cur_disk,))
         self.path_cache.clear()
@@ -1766,6 +1860,9 @@ class App(tk.Tk):
         self.row_info = {}
         self.prog_info = {}
         self.note_info = {}
+        self._hidden_ids = {r[0] for r in self.conn.execute(
+            "SELECT entry_id FROM hidden WHERE entry_id IS NOT NULL")}
+        self._hidden_walk = {}
         more = len(rows) > PAGE_SIZE
         rows = rows[:PAGE_SIZE]
         names = {}
@@ -1780,7 +1877,9 @@ class App(tk.Tk):
                     names[disk_id] = self.disk_row(disk_id)[0]
                 loc = f"{names[disk_id]}\\{self.path_of(pid)}"
             self.tree.insert("", "end", iid=str(eid), text=("■ " if is_dir else "　 ") + name
-                             + ("　［番組情報あり］" if title is not None else ""),
+                             + ("　［番組情報あり］" if title is not None else "")
+                             + ("　［CSVで隠す］" if eid in self._hidden_ids
+                                else "　［CSVで隠す:上のフォルダごと］" if self._under_hidden(pid) else ""),
                              values=((note or "").replace("\n", " "), fmt_size(size), fmt_time(mtime),
                                      "フォルダ" if is_dir else ext,
                                      f"{bdate or ''} {btime or ''}".strip(), channel or "", loc))
@@ -1863,6 +1962,69 @@ class App(tk.Tk):
         self.txt_detail.delete("1.0", "end")
         self.txt_detail.insert("1.0", text)
         self.txt_detail.configure(state="disabled")
+
+    # ---------------- CSVで隠す設定
+    def _under_hidden(self, folder_id):
+        """folder_id のフォルダ自身か、その上のどれかが「CSVで隠す」になっているか"""
+        if not self._hidden_ids:
+            return False
+        chain, x, found = [], folder_id, False
+        while x:
+            if x in self._hidden_walk:
+                found = self._hidden_walk[x]
+                break
+            chain.append(x)
+            if x in self._hidden_ids:
+                found = True
+                break
+            r = self.conn.execute("SELECT parent_id FROM entries WHERE id=?", (x,)).fetchone()
+            x = r[0] if r else 0
+        for c in chain:
+            self._hidden_walk[c] = found
+        return found
+
+    def toggle_hidden(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo(APP_NAME, "CSVで隠したいファイルかフォルダを選んでください。")
+            return
+        eid = int(sel[0])
+        disk_id, pid, name, is_dir = self.row_info[eid]
+        if eid in self._hidden_ids:
+            with self.conn:
+                self.conn.execute("DELETE FROM hidden WHERE entry_id=?", (eid,))
+            text = f"「{name}」を隠すのをやめました。CSVに出ます。"
+        elif self._under_hidden(pid):
+            messagebox.showinfo(APP_NAME, "上のフォルダごと隠す設定になっています。\n"
+                                "これだけを出したいときは、上のフォルダの設定を戻してから、"
+                                "隠したいものを個別に選んでください。")
+            return
+        else:
+            with self.conn:
+                self.conn.execute("INSERT INTO hidden(disk_id,path,entry_id) VALUES(?,?,?)",
+                                  (disk_id, self.path_of(eid), eid))
+            text = (f"「{name}」を、人に渡すCSVに出さないようにしました"
+                    + ("(中身ごと)。" if is_dir else "。") + "この画面では今までどおり見えます。")
+        yview = self.tree.yview()
+        self.show()
+        if self.tree.exists(str(eid)):
+            self._select_row(eid, True)
+            self.tree.yview_moveto(yview[0])
+        self.var_status.set(text)
+
+    def show_hidden_list(self):
+        names = dict(self.conn.execute("SELECT id,name FROM disks"))
+        marks = hidden_marks(self.conn, self.disk_ids)
+        if not marks:
+            messagebox.showinfo(APP_NAME, "CSVで隠す設定は、まだありません。\n\n"
+                                "隠したいファイルやフォルダを選んで、「CSVで隠す／戻す」を押してください。")
+            return
+        lines = [f"{names.get(d, '?')}\\{p}" + ("" if e else "　※今の記録に見つかりません")
+                 for d, p, e in marks[:30]]
+        more = f"\n…ほか {len(marks) - 30} 件" if len(marks) > 30 else ""
+        messagebox.showinfo(
+            APP_NAME, f"CSVで隠す設定: {len(marks)} 件\n\n" + "\n".join(lines) + more
+            + "\n\n戻すには、その場所を開いて「CSVで隠す／戻す」を押してください。", parent=self)
 
     def edit_note(self):
         sel = self.tree.selection()
@@ -2009,6 +2171,8 @@ class App(tk.Tk):
         if iid:
             self.tree.selection_set(iid)
             self.menu.entryconfigure(2, state="normal" if self.search_mode else "disabled")
+            self.menu.entryconfigure(5, label="CSVで隠すのをやめる" if int(iid) in self._hidden_ids
+                                     else "CSVで隠す (人に渡すCSVに出さない)")
             self.menu.tk_popup(e.x_root, e.y_root)
 
     def copy_path(self, name_only=False):
@@ -2043,6 +2207,24 @@ class App(tk.Tk):
         if not targets:
             messagebox.showinfo(APP_NAME, "書き出せるディスクがありません。")
             return
+        # 隠す設定があるときは、隠して書き出すか(人に渡す用)、全部書き出すか(自分用)を選ぶ
+        marks = hidden_marks(self.conn, targets)
+        hide = False
+        if marks:
+            lost = [p for _d, p, e in marks if not e]
+            msg = (f"CSVで隠す設定が {len(marks)} 件あります。\n\n"
+                   "はい: 隠して書き出す (人に渡す用)\n"
+                   "いいえ: 隠さずに全部書き出す (自分用)")
+            if lost:
+                msg += (f"\n\n※{len(lost)} 件は、今の記録に場所が見つかりません(名前を変えた・移動した可能性)。"
+                        "その分は隠せません。「保存 → CSVで隠す設定の一覧」で確かめてください。")
+            ans = messagebox.askyesnocancel(APP_NAME, msg, default=messagebox.YES,
+                                            icon="warning" if lost else "question", parent=self)
+            if ans is None:
+                return
+            hide = ans
+            if not hide:
+                default = default[:-4] + "_全部.csv"
         for ch in '\\/:*?"<>|':
             default = default.replace(ch, "_")
         fn = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=default,
@@ -2052,27 +2234,21 @@ class App(tk.Tk):
         self.configure(cursor="watch")
         self.update_idletasks()
         try:
+            stats = {}
             with open(fn, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(["ディスク", "パス", "種別", "拡張子", "サイズ(バイト)", "サイズ", "更新日時",
-                            "番組名", "放送日", "開始時刻", "チャンネル", "番組内容", "メモ"])
+                w.writerow(CSV_HEADER)
                 n = 0
                 for d in targets:
-                    dname = self.disk_row(d)[0]
-                    paths = {0: ""}
-                    for (eid, _d, pid, name, is_dir, size, mtime, ext, title, bdate, btime,
-                         channel, detail, note) in self.conn.execute(
-                            f"{SELECT_ROWS} WHERE e.disk_id=? ORDER BY e.id", (d,)):
-                        base = paths.get(pid, "")
-                        p = f"{base}\\{name}" if base else name
-                        if is_dir:
-                            paths[eid] = p
-                        w.writerow([dname, p, "フォルダ" if is_dir else "ファイル", ext,
-                                    size, fmt_size(size), fmt_time(mtime),
-                                    title or "", bdate or "", btime or "", channel or "",
-                                    detail or "", note or ""])
+                    for row in export_rows(self.conn, d, self.disk_row(d)[0], hide, stats):
+                        w.writerow(row)
                         n += 1
-            self.var_status.set(f"{n:,} 行を書き出しました: {fn}")
+            text = f"{n:,} 行を書き出しました: {fn}"
+            if hide:
+                text += f"  (隠す設定により {stats.get('skipped', 0):,} 行を除きました)"
+            elif marks:
+                text += "  (隠す設定のものも含めて、全部書き出しました)"
+            self.var_status.set(text)
         except OSError as ex:
             messagebox.showerror(APP_NAME, f"書き出しに失敗しました。\n{ex}")
         finally:
@@ -2098,6 +2274,10 @@ class App(tk.Tk):
                 self.conn.backup(dst)
             dst.close()
             self.var_status.set(f"バックアップしました: {fn}")
+            if hidden_marks(self.conn, self.disk_ids):
+                messagebox.showinfo(
+                    APP_NAME, "バックアップしました。\n\nこのファイルには、CSVで隠す設定のものも含めて、"
+                    "記録のすべてが入っています。人に渡すときは、CSVの書き出しを使ってください。", parent=self)
         except (OSError, sqlite3.Error) as ex:
             messagebox.showerror(APP_NAME, f"バックアップに失敗しました。\n{ex}")
 

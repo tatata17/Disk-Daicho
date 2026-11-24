@@ -238,10 +238,79 @@ def test_name_clash_message():
     check("ほかの同名の件数を知らせる", "ほかに 2 件" in old, True)
 
 
+def test_hidden_export():
+    root = os.path.join(WORK, "diskH")
+    write(os.path.join(root, "公開", "a.mkv"), b"1" * 100)
+    write(os.path.join(root, "公開", "ひみつ", "x.mkv"), b"2" * 1000)
+    write(os.path.join(root, "公開", "ひみつ", "深い", "y.mkv"), b"3" * 2000)
+    write(os.path.join(root, "公開", "b.txt"), b"4" * 10)
+    write(os.path.join(root, "はずかしい.iso"), b"5" * 500)
+    write(os.path.join(root, "ひみつでない", "z.mkv"), b"6" * 7)
+    did = scan(root, "H")[1]
+    conn = app.connect()
+
+    def mark(path):
+        eid, parent = None, 0
+        for part in path.split("\\"):
+            eid = parent = conn.execute("SELECT id FROM entries WHERE disk_id=? AND parent_id=? AND name=?",
+                                        (did, parent, part)).fetchone()[0]
+        with conn:
+            conn.execute("INSERT INTO hidden(disk_id,path,entry_id) VALUES(?,?,?)", (did, path, eid))
+
+    def export(hide=True):
+        stats = {}
+        rows = list(app.export_rows(conn, did, "H", hide, stats))
+        return {r[1]: r[4] for r in rows}, stats.get("skipped", 0)
+
+    everything, _ = export()
+    check("設定が無ければ全部出る", len(everything), 10)
+    check("フォルダの合計(隠す前)", (everything["公開"], everything["公開\\ひみつ"]), (3110, 3000))
+
+    mark("公開\\ひみつ")           # フォルダ(中身ごと)
+    mark("公開\\ひみつ\\深い")     # その中をさらに設定しても、二重に引かない
+    mark("はずかしい.iso")         # ファイル
+    got, skipped = export()
+    check("隠したフォルダ・その中身・隠したファイルが出ない", sorted(got),
+          ["ひみつでない", "ひみつでない\\z.mkv", "公開", "公開\\a.mkv", "公開\\b.txt"])
+    check("名前が似ているだけのフォルダは出る", "ひみつでない" in got, True)
+    check("除いた行数", skipped, 5)
+    check("上のフォルダの合計から、隠した分を引く", got["公開"], 110)
+    check("どの行にも隠した名前が残らない", [p for p in got if "ひみつ\\" in p or p.endswith("ひみつ") or "はずかしい" in p], [])
+    full, skipped_full = export(hide=False)
+    check("「全部書き出す」なら今までどおり", (len(full), skipped_full, full["公開"]), (10, 0, 3110))
+
+    # 記録し直しても、同じ場所に付いたまま
+    write(os.path.join(root, "公開", "ひみつ", "新しい.mkv"), b"7" * 50)
+    r = scan(root, "H", replace_id=did)
+    did = r[1]
+    check("記録し直しても設定は残る(見つからないもの無し)", r[7], [])
+    got, _ = export()
+    check("あとから足したファイルも隠れる", sorted(got),
+          ["ひみつでない", "ひみつでない\\z.mkv", "公開", "公開\\a.mkv", "公開\\b.txt"])
+    check("合計も引き直される", got["公開"], 110)
+
+    # フォルダの名前を変えると、設定の場所が見つからなくなる → 知らせる
+    os.rename(os.path.join(root, "公開", "ひみつ"), os.path.join(root, "公開", "改名した"))
+    r = scan(root, "H", replace_id=did)
+    did = r[1]
+    check("名前を変えたら、見つからない設定として返す", sorted(r[7]), ["公開\\ひみつ", "公開\\ひみつ\\深い"])
+    marks = app.hidden_marks(conn, [did])
+    check("設定は消さずに残す(見つからない印つき)",
+          [(p, e is not None) for _d, p, e in marks],
+          [("はずかしい.iso", True), ("公開\\ひみつ", False), ("公開\\ひみつ\\深い", False)])
+    r = scan(root, "H", replace_id=did)
+    check("同じ知らせを繰り返さない", r[7], [])
+    os.rename(os.path.join(root, "公開", "改名した"), os.path.join(root, "公開", "ひみつ"))
+    r = scan(root, "H", replace_id=r[1])
+    got = {row[1] for row in app.export_rows(conn, r[1], "H", True)}
+    check("元の名前に戻せば、また隠れる", any("ひみつ\\" in p for p in got), False)
+    conn.close()
+
+
 def main():
     try:
         for fn in (test_settings, test_summary, test_info_csv_inherit, test_connected_records, test_diff,
-                   test_same_name_labels, test_name_clash_message):
+                   test_same_name_labels, test_name_clash_message, test_hidden_export):
             fn()
             print(f"OK  {fn.__name__}")
     finally:
