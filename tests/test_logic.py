@@ -349,7 +349,8 @@ def test_zip_contents():
     r = scan(root, "Z")
     did = r[1]
     conn = app.connect()
-    check("中身を読んだzipの数", r[8], 2)
+    check("記録できたzip 2個、読めなかったzip 1個(壊れた.zip)、一部のみは無し。初回なので知らせる",
+          r[8], (2, [], ["壊れた.zip"], True))
     zip_size = os.path.getsize(zp)
     used = conn.execute("SELECT n_files,n_dirs,used FROM disks WHERE id=?", (did,)).fetchone()
     check("件数と合計に、zipの中身は入れない", used,
@@ -387,22 +388,90 @@ def test_zip_contents():
     # 読まない設定・階層の制限・引き継ぎ
     r3 = scan(root, "Z", replace_id=did, read_zip=False)
     check("読まない設定なら中身は記録しない",
-          (r3[8], conn.execute("SELECT COUNT(*) FROM entries WHERE disk_id=?", (r3[1],)).fetchone()[0]), (0, 4))
+          (r3[8], conn.execute("SELECT COUNT(*) FROM entries WHERE disk_id=?", (r3[1],)).fetchone()[0]),
+          ((0, [], [], False), 4))
     check("読まない設定を引き継ぐ", app.disk_read_zip(conn, r3[1]), False)
     r4 = scan(root, "Z", replace_id=r3[1], max_depth=1)
-    check("階層の上限より深いzipは読まない(直下のzipも、中身は次の階層なので読まない)", r4[8], 0)
+    check("階層の上限より深いzipは読まない(直下のzipも、中身は次の階層なので読まない)", r4[8][0], 0)
     r5 = scan(root, "Z", replace_id=r4[1], max_depth=2)
-    check("上限が2階層なら、直下のzipの中身までは読む", r5[8], 1)
+    check("上限が2階層なら、直下のzipの中身までは読む", r5[8][0], 1)
     with conn:
         conn.execute("DELETE FROM settings WHERE key=?", (f"zip_{r5[1]}",))
     check("保存値の無い旧記録は「読む」", app.disk_read_zip(conn, r5[1]), True)
     conn.close()
 
 
+def test_zip_states():
+    """zip の中身を「すべて記録・一部のみ・読めなかった・空」に正しく分けること"""
+    import zipfile
+    root = os.path.join(WORK, "diskZS")
+    make_zip(os.path.join(root, "ふつう.zip"), [("a.txt", b"1"), ("b.txt", b"2")])
+    make_zip(os.path.join(root, "sub", "多い.zip"), [(f"f{i:02d}.txt", b"x") for i in range(7)])
+    make_zip(os.path.join(root, "ちょうど.zip"), [(f"g{i}.txt", b"x") for i in range(5)])
+    os.makedirs(os.path.join(root, "sub"), exist_ok=True)
+    with zipfile.ZipFile(os.path.join(root, "空.zip"), "w"):
+        pass
+    write(os.path.join(root, "sub", "壊れた.zip"), b"PK\x03\x04 broken")
+    write(os.path.join(root, "名前だけ.zip"), b"")
+    write(os.path.join(root, "ただの.txt"), b"t")
+
+    saved = app.ZIP_MAX_ENTRIES
+    app.ZIP_MAX_ENTRIES = 5   # テストでは上限を5件にする
+    try:
+        info = {}
+        listing = app.zip_listing(os.path.join(root, "sub", "多い.zip"), info=info)
+        check("上限を超えた分は読まず、全部で何件あったかは分かる", (len(listing), info["total"]), (5, 7))
+
+        def state(*parts):
+            return app.zip_rows(os.path.join(root, *parts), 1, 1, 100)[2]
+        check("すべて記録", state("ふつう.zip"), "ok")
+        check("上限ちょうどは「すべて記録」", state("ちょうど.zip"), "ok")
+        check("上限を超えたら「一部のみ」", state("sub", "多い.zip"), "partial")
+        check("壊れたzipは「読めなかった」", state("sub", "壊れた.zip"), "failed")
+        check("0バイトのzipも「読めなかった」", state("名前だけ.zip"), "failed")
+        check("中身が無いzipは「空」(失敗ではない)", state("空.zip"), "empty")
+
+        r = scan(root, "ZS")
+        ok, partial, failed, news = r[8]
+        sub = "sub" + os.sep
+        check("記録の集計: すべて記録 2個", ok, 2)
+        check("記録の集計: 一部のみ(ディスク内のパス)", partial, [sub + "多い.zip"])
+        check("記録の集計: 読めなかった(空のzipは入らない)", sorted(failed), sorted(["名前だけ.zip", sub + "壊れた.zip"]))
+        check("初回は知らせる", news, True)
+        conn = app.connect()
+        n = conn.execute("SELECT COUNT(*) FROM entries e JOIN entries z ON z.id=e.parent_id "
+                         "WHERE z.disk_id=? AND z.name='多い.zip'", (r[1],)).fetchone()[0]
+        check("一部のみのzipは、上限の件数まで記録されている", n, 5)
+        check("読めなかったzipも、ファイルとしては記録されている",
+              conn.execute("SELECT COUNT(*) FROM entries WHERE disk_id=? AND name='壊れた.zip'", (r[1],)).fetchone()[0], 1)
+
+        r2 = scan(root, "ZS", replace_id=r[1])
+        check("同じ顔ぶれなら、次は知らせない(集計は毎回出す)", (r2[8][0], len(r2[8][1]), len(r2[8][2]), r2[8][3]),
+              (2, 1, 2, False))
+        write(os.path.join(root, "新しく壊れた.zip"), b"zzz")
+        r3 = scan(root, "ZS", replace_id=r2[1])
+        check("顔ぶれが変わったら、また知らせる", (len(r3[8][2]), r3[8][3]), (3, True))
+        for name in ("新しく壊れた.zip", "名前だけ.zip"):
+            os.remove(os.path.join(root, name))
+        os.remove(os.path.join(root, "sub", "壊れた.zip"))
+        os.remove(os.path.join(root, "sub", "多い.zip"))
+        r4 = scan(root, "ZS", replace_id=r3[1])
+        check("問題のzipが無くなれば、知らせない", r4[8], (2, [], [], False))
+        check("控えも残さない", conn.execute("SELECT COUNT(*) FROM settings WHERE key IN (?,?)",
+                                           (f"zipwarn_{r4[1]}", f"zipwarn_{r3[1]}")).fetchone()[0], 0)
+        r5 = scan(root, "ZS", replace_id=r4[1], read_zip=False)
+        check("読まない設定のzipは、失敗に数えない", r5[8], (0, [], [], False))
+        conn.close()
+    finally:
+        app.ZIP_MAX_ENTRIES = saved
+    check("上限そのものは 20,000 件のまま", app.ZIP_MAX_ENTRIES, 20000)
+
+
 def main():
     try:
         for fn in (test_settings, test_summary, test_info_csv_inherit, test_connected_records, test_diff,
-                   test_same_name_labels, test_name_clash_message, test_hidden_export, test_zip_contents):
+                   test_same_name_labels, test_name_clash_message, test_hidden_export, test_zip_contents,
+                   test_zip_states):
             fn()
             print(f"OK  {fn.__name__}")
     finally:

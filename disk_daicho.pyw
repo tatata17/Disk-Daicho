@@ -35,7 +35,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.28.1"
+APP_VERSION = "2026.11.28.2"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -567,18 +567,24 @@ def _zip_time(date_time):
         return None
 
 
-def zip_listing(path, limit=ZIP_MAX_ENTRIES):
+def zip_listing(path, limit=None, info=None):
     """
     zip の中身の一覧を返す: [((フォルダ, …, 名前), フォルダか, サイズ, 更新日時)]。親が必ず子より先に並ぶ。
     展開はせず、zip の末尾にある一覧だけを読む(読み取り専用で開く。zip には何も書き込まない)。
     サイズは展開後の大きさ。フォルダのサイズは、中のファイルの合計。読めない zip は None。
+    limit(既定は ZIP_MAX_ENTRIES)件を超える分は読まない。info に辞書を渡すと、zip の一覧に
+    全部で何件あったかを info["total"] に入れる(上限で切ったかどうかを呼び出し側が知るため)。
     """
+    if limit is None:
+        limit = ZIP_MAX_ENTRIES
     try:
         with zipfile.ZipFile(path) as z:
             infos = z.infolist()
     except (zipfile.BadZipFile, OSError, ValueError, NotImplementedError, RuntimeError, EOFError,
             MemoryError):
         return None
+    if info is not None:
+        info["total"] = len(infos)
     out = {}
 
     def need_dir(parts):
@@ -614,10 +620,20 @@ def zip_listing(path, limit=ZIP_MAX_ENTRIES):
 
 
 def zip_rows(path, disk_id, zip_id, next_id):
-    """zip の中身を、entries に入れる行にする。親は zip のファイルの行(zip_id)。(行のリスト, 次に使うid) を返す"""
-    listing = zip_listing(path)
+    """
+    zip の中身を、entries に入れる行にする。親は zip のファイルの行(zip_id)。
+    (行のリスト, 次に使うid, 状態) を返す。状態は次のどれか:
+      "ok"      中身をすべて記録できた
+      "partial" 中身が上限(ZIP_MAX_ENTRIES)を超えていて、先頭の分だけ記録した
+      "failed"  読めなかった(壊れている・zipではない・対応していない形式など)
+      "empty"   読めたが、中身が1件も無い
+    """
+    info = {}
+    listing = zip_listing(path, info=info)
+    if listing is None:
+        return [], next_id, "failed"
     if not listing:
-        return [], next_id
+        return [], next_id, "empty"
     ids, rows = {}, []
     for parts, is_dir, size, mt in listing:
         ids[parts] = next_id
@@ -625,7 +641,15 @@ def zip_rows(path, disk_id, zip_id, next_id):
         rows.append((next_id, disk_id, ids.get(parts[:-1], zip_id), parts[-1], 1 if is_dir else 0,
                      size, mt, ext))
         next_id += 1
-    return rows, next_id
+    return rows, next_id, ("partial" if info.get("total", 0) > ZIP_MAX_ENTRIES else "ok")
+
+
+def zip_warn_signature(partial, failed):
+    """一部のみ・読めなかった zip の顔ぶれを表す短い文字列。前回と同じ内容なら同じになる(無ければ空文字)"""
+    if not partial and not failed:
+        return ""
+    text = "\n".join(sorted(partial)) + "\n|\n" + "\n".join(sorted(failed))
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:32]
 
 
 def parse_sidecar_csv(path):
@@ -732,7 +756,9 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
 
         dir_size = {0: 0}
         dir_parent = {}
-        n_files = n_dirs = n_skipped = n_info = n_zip = 0
+        n_files = n_dirs = n_skipped = n_info = 0
+        zip_ok = 0                      # 中身をすべて記録できた zip の数
+        zip_partial, zip_failed = [], []  # 一部のみ記録した zip / 読めなかった zip (ディスク内のパス)
         diff = None
         lost_hidden = []   # 記録し直して、隠す設定の場所が見つからなくなったもの
         rows = []
@@ -792,10 +818,16 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
                                 if (read_zip and ext == "zip"
                                         and (max_depth is None or depth < max_depth)):
                                     # zip の中身。zip の行を親にして載せる(サイズや件数の合計には入れない)
-                                    inner, next_id = zip_rows(e.path, disk_id, fid, next_id)
-                                    if inner:
-                                        rows.extend(inner)
-                                        n_zip += 1
+                                    inner, next_id, zstate = zip_rows(e.path, disk_id, fid, next_id)
+                                    rows.extend(inner)
+                                    if zstate == "ok":
+                                        zip_ok += 1
+                                    elif zstate in ("partial", "failed"):
+                                        try:
+                                            rel = os.path.relpath(e.path, root)
+                                        except ValueError:
+                                            rel = e.path
+                                        (zip_partial if zstate == "partial" else zip_failed).append(rel)
                     except OSError:
                         n_skipped += 1
             if csvs:  # 動画と同名のcsvがあれば番組情報として読む
@@ -854,13 +886,24 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
             cur.execute("DELETE FROM disks WHERE id=?", (replace_id,))
             cur.execute("DELETE FROM settings WHERE key IN (?,?)",
                         (f"info_csv_{replace_id}", f"zip_{replace_id}"))
+        # 一部のみ・読めなかった zip の顔ぶれを控える。前回と同じなら、完了時に同じ知らせを繰り返さない
+        zip_sig = zip_warn_signature(zip_partial, zip_failed)
+        prev_sig = ""
+        if replace_id:
+            r = cur.execute("SELECT value FROM settings WHERE key=?", (f"zipwarn_{replace_id}",)).fetchone()
+            prev_sig = r[0] if r else ""
+            cur.execute("DELETE FROM settings WHERE key=?", (f"zipwarn_{replace_id}",))
+        if zip_sig:
+            cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                        (f"zipwarn_{disk_id}", zip_sig))
         # 番組情報csvを読み取ったかどうかを、このディスクの値として残す(ワンクリック更新で引き継ぐ)
         cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
                     (f"info_csv_{disk_id}", "1" if read_info else "0"))
         cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
                     (f"zip_{disk_id}", "1" if read_zip else "0"))
         conn.commit()
-        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info, diff, lost_hidden, n_zip))
+        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info, diff, lost_hidden,
+               (zip_ok, zip_partial, zip_failed, bool(zip_sig) and zip_sig != prev_sig)))
     except Exception as ex:  # noqa: BLE001
         conn.rollback()
         q.put(("error", f"{type(ex).__name__}: {ex}"))
@@ -1788,8 +1831,13 @@ class App(tk.Tk):
                 if msg[0] == "done":
                     skipped = f" (読めなかった場所 {msg[4]:,} 件)" if msg[4] else ""
                     info = f" / 番組情報 {msg[5]:,} 件" if msg[5] else ""
-                    if msg[8]:
-                        info += f" / 中身を読んだzip {msg[8]:,} 個"
+                    zip_ok, zip_partial, zip_failed, zip_news = msg[8]
+                    if zip_ok or zip_partial or zip_failed:
+                        info += f" / zipの中身: 記録 {zip_ok:,} 個"
+                        if zip_partial:
+                            info += f"・一部のみ {len(zip_partial):,} 個"
+                        if zip_failed:
+                            info += f"・読めず {len(zip_failed):,} 個"
                     text = f"記録しました。ファイル {msg[2]:,} / フォルダ {msg[3]:,}{info}{skipped}"
                     diff = msg[6]
                     if diff:
@@ -1799,6 +1847,23 @@ class App(tk.Tk):
                     self.var_name.set("")
                     self.refresh_disks(select_id=msg[1])
                     self.reload_drives()
+                    if zip_news:  # 一部のみ・読めなかった zip がある(前回と同じ顔ぶれなら出さない)
+                        def listed(paths):
+                            more = f"\n　…ほか {len(paths) - 20} 個" if len(paths) > 20 else ""
+                            return "\n".join("　" + x for x in paths[:20]) + more
+                        text_zip = ""
+                        if zip_partial:
+                            text_zip += (f"【一部のみ記録した zip: {len(zip_partial):,} 個】\n"
+                                         f"中のファイルが {ZIP_MAX_ENTRIES:,} 件を超えるため、先頭の "
+                                         f"{ZIP_MAX_ENTRIES:,} 件だけ記録しました。\n{listed(zip_partial)}\n\n")
+                        if zip_failed:
+                            text_zip += (f"【中身を読めなかった zip: {len(zip_failed):,} 個】\n"
+                                         "壊れている・zip ではない・対応していない形式、などの可能性があります。"
+                                         f"ファイルとしては記録しています。\n{listed(zip_failed)}\n\n")
+                        messagebox.showwarning(
+                            APP_NAME, "zip の中身を、すべては記録できませんでした。\n"
+                            "下の zip の中にあるファイルは、検索しても見つからないことがあります。\n\n"
+                            + text_zip + "(同じ内容なら、次に記録し直したときは、この知らせは出しません)", parent=self)
                     if msg[7]:  # 隠す設定の場所が無くなった。そのままだとCSVに出てしまうので必ず知らせる
                         shown = "\n".join("　" + x for x in msg[7][:10])
                         more = f"\n　…ほか {len(msg[7]) - 10} 件" if len(msg[7]) > 10 else ""
@@ -1920,8 +1985,9 @@ class App(tk.Tk):
             self.conn.execute("DELETE FROM programs WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM notes WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM hidden WHERE disk_id=?", (self.cur_disk,))
-            self.conn.execute("DELETE FROM settings WHERE key IN (?,?)",
-                              (f"info_csv_{self.cur_disk}", f"zip_{self.cur_disk}"))
+            self.conn.execute("DELETE FROM settings WHERE key IN (?,?,?)",
+                              (f"info_csv_{self.cur_disk}", f"zip_{self.cur_disk}",
+                               f"zipwarn_{self.cur_disk}"))
             self.conn.execute("DELETE FROM disks WHERE id=?", (self.cur_disk,))
         self.path_cache.clear()
         self.cur_disk = None
