@@ -41,9 +41,9 @@ def check(label, got, want):
     PASSED += 1
 
 
-def scan(root, name, folders_only=False, max_depth=None, replace_id=None, read_info=True):
+def scan(root, name, folders_only=False, max_depth=None, replace_id=None, read_info=True, read_zip=True):
     q = queue.Queue()
-    app.scan_disk(root, name, folders_only, max_depth, replace_id, threading.Event(), q, read_info)
+    app.scan_disk(root, name, folders_only, max_depth, replace_id, threading.Event(), q, read_info, read_zip)
     msg = q.get()
     while msg[0] == "progress":
         msg = q.get()
@@ -60,8 +60,8 @@ def write(path, data=b"x"):
 def test_settings():
     conn = app.connect()
     check("初期値", app.load_rec_options(conn),
-          {"folders_only": False, "depth_mode": False, "depth": 2, "info_csv": True})
-    opts = {"folders_only": True, "depth_mode": True, "depth": 5, "info_csv": False}
+          {"folders_only": False, "depth_mode": False, "depth": 2, "info_csv": True, "read_zip": True})
+    opts = {"folders_only": True, "depth_mode": True, "depth": 5, "info_csv": False, "read_zip": False}
     app.save_rec_options(conn, opts)
     conn.close()
     conn = app.connect()   # 起動し直したのと同じ
@@ -69,17 +69,20 @@ def test_settings():
     with conn:
         conn.execute("UPDATE settings SET value='abc' WHERE key='rec_depth'")
     check("壊れた階層数は初期値", app.load_rec_options(conn)["depth"], 2)
-    app.save_rec_options(conn, {"folders_only": False, "depth_mode": False, "depth": 2, "info_csv": True})
+    app.save_rec_options(conn, {"folders_only": False, "depth_mode": False, "depth": 2, "info_csv": True,
+                                "read_zip": True})
     conn.close()
 
 
 def test_summary():
     check("初期値の要約", app.rec_summary(False, False, 2, True),
-          ("フォルダ＋ファイル / 全階層 / csv読取ON", True))
+          ("フォルダ＋ファイル / 全階層 / csv読取ON / zip読取ON", True))
     check("フォルダのみは要約から分かる", app.rec_summary(True, False, 2, True),
-          ("フォルダのみ / 全階層 / csv読取ON", False))
+          ("フォルダのみ / 全階層 / csv読取ON / zip読取ON", False))
     check("階層指定とcsvOFF", app.rec_summary(False, True, 3, False),
-          ("フォルダ＋ファイル / 3階層まで / csv読取OFF", False))
+          ("フォルダ＋ファイル / 3階層まで / csv読取OFF / zip読取ON", False))
+    check("zipを読まない設定は要約から分かる", app.rec_summary(False, False, 2, True, False),
+          ("フォルダ＋ファイル / 全階層 / csv読取ON / zip読取OFF", False))
 
 
 def sidecar(path, title):
@@ -307,10 +310,99 @@ def test_hidden_export():
     conn.close()
 
 
+def make_zip(path, names, sjis=False):
+    """テスト用の zip を作る。sjis=True なら、古いWindowsのように Shift_JIS の名前(UTF-8の印なし)で書く"""
+    import zipfile
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    orig = zipfile.ZipInfo._encodeFilenameFlags
+    if sjis:
+        zipfile.ZipInfo._encodeFilenameFlags = lambda self: (self.filename.encode("cp932"), self.flag_bits & ~0x800)
+    try:
+        with zipfile.ZipFile(path, "w") as z:
+            for name, data in names:
+                z.writestr(zipfile.ZipInfo(name, date_time=(2026, 11, 1, 12, 0, 0)), data)
+    finally:
+        zipfile.ZipInfo._encodeFilenameFlags = orig
+
+
+def test_zip_contents():
+    root = os.path.join(WORK, "diskZ")
+    zp = os.path.join(root, "保管", "まとめ.zip")
+    make_zip(zp, [("docs/readme.txt", b"a" * 10), ("docs/sub/写真.jpg", b"b" * 200), ("top.mkv", b"c" * 3000),
+                  ("empty/", b"")])
+    listing = app.zip_listing(zp)
+    check("zipの中身(親が先・途中のフォルダを補う・フォルダは中の合計)",
+          [(p, d, sz) for p, d, sz, _t in listing],
+          [(("docs",), True, 210), (("empty",), True, 0), (("top.mkv",), False, 3000),
+           (("docs", "readme.txt"), False, 10), (("docs", "sub"), True, 200),
+           (("docs", "sub", "写真.jpg"), False, 200)])
+    check("更新日時も読む", listing[2][3] is not None, True)
+    old = os.path.join(root, "古い.zip")
+    make_zip(old, [("表紙\\ソフト一覧.txt", b"x"), ("能力/予定表.txt", b"y")], sjis=True)
+    check("Shift_JISの名前(「表」「ソ」「能」など)が壊れない、\\区切りも分ける",
+          [p for p, d, _s, _t in app.zip_listing(old) if not d],
+          [("能力", "予定表.txt"), ("表紙", "ソフト一覧.txt")])
+    write(os.path.join(root, "壊れた.zip"), b"this is not a zip")
+    check("壊れたzipは読まずに済ませる", app.zip_listing(os.path.join(root, "壊れた.zip")), None)
+    before = open(zp, "rb").read()
+
+    r = scan(root, "Z")
+    did = r[1]
+    conn = app.connect()
+    check("中身を読んだzipの数", r[8], 2)
+    zip_size = os.path.getsize(zp)
+    used = conn.execute("SELECT n_files,n_dirs,used FROM disks WHERE id=?", (did,)).fetchone()
+    check("件数と合計に、zipの中身は入れない", used,
+          (3, 1, zip_size + os.path.getsize(old) + len(b"this is not a zip")))
+    check("zipには何も書き込まない", open(zp, "rb").read() == before, True)
+
+    def path_of(eid):
+        parts = []
+        while eid:
+            pid, name = conn.execute("SELECT parent_id,name FROM entries WHERE id=?", (eid,)).fetchone()
+            parts.append(name)
+            eid = pid
+        return "\\".join(reversed(parts))
+
+    hit = conn.execute("SELECT id FROM entries WHERE disk_id=? AND name LIKE '%写真%'", (did,)).fetchall()
+    check("中のファイル名で見つかり、場所がzipの中と分かる", [path_of(h[0]) for h in hit],
+          ["保管\\まとめ.zip\\docs\\sub\\写真.jpg"])
+    rows = {row[1]: (row[2], row[4]) for row in app.export_rows(conn, did, "Z", True)}
+    check("CSVに中身が出る", rows["保管\\まとめ.zip\\docs\\readme.txt"], ("ファイル", 10))
+    check("CSVのzip自体はファイルのまま", rows["保管\\まとめ.zip"], ("ファイル", zip_size))
+
+    # 差分: zipの中身は数えない
+    make_zip(zp, [("docs/readme.txt", b"a" * 10), ("新しい.txt", b"n" * 5)])
+    r2 = scan(root, "Z", replace_id=did)
+    check("zipを作り直しても、差分は「zip 1件のサイズ変化」だけ", r2[6][:3], (0, 0, 1))
+    did = r2[1]
+
+    # 隠す設定: zipごと隠すと中身も出ない
+    eid = conn.execute("SELECT id FROM entries WHERE disk_id=? AND name='まとめ.zip'", (did,)).fetchone()[0]
+    with conn:
+        conn.execute("INSERT INTO hidden(disk_id,path,entry_id) VALUES(?,?,?)", (did, "保管\\まとめ.zip", eid))
+    got = [row[1] for row in app.export_rows(conn, did, "Z", True)]
+    check("zipを隠すと、中身ごと出ない", [p for p in got if "まとめ.zip" in p], [])
+
+    # 読まない設定・階層の制限・引き継ぎ
+    r3 = scan(root, "Z", replace_id=did, read_zip=False)
+    check("読まない設定なら中身は記録しない",
+          (r3[8], conn.execute("SELECT COUNT(*) FROM entries WHERE disk_id=?", (r3[1],)).fetchone()[0]), (0, 4))
+    check("読まない設定を引き継ぐ", app.disk_read_zip(conn, r3[1]), False)
+    r4 = scan(root, "Z", replace_id=r3[1], max_depth=1)
+    check("階層の上限より深いzipは読まない(直下のzipも、中身は次の階層なので読まない)", r4[8], 0)
+    r5 = scan(root, "Z", replace_id=r4[1], max_depth=2)
+    check("上限が2階層なら、直下のzipの中身までは読む", r5[8], 1)
+    with conn:
+        conn.execute("DELETE FROM settings WHERE key=?", (f"zip_{r5[1]}",))
+    check("保存値の無い旧記録は「読む」", app.disk_read_zip(conn, r5[1]), True)
+    conn.close()
+
+
 def main():
     try:
         for fn in (test_settings, test_summary, test_info_csv_inherit, test_connected_records, test_diff,
-                   test_same_name_labels, test_name_clash_message, test_hidden_export):
+                   test_same_name_labels, test_name_clash_message, test_hidden_export, test_zip_contents):
             fn()
             print(f"OK  {fn.__name__}")
     finally:

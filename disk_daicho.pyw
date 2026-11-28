@@ -8,6 +8,7 @@
   番組名・放送日・チャンネル・番組内容を一緒に記録して検索できる
 ・ファイルやフォルダごとにメモを書ける (名前を付け直していないisoなどに「これは何のファイルか」を残せる)
 ・「ヘルプ → アップデートを確認」で、GitHubの最新版に更新できる(今の版は自動でバックアップ)
+・zip の中身(ファイルの一覧)も記録して、検索できる(展開はせず、一覧を読むだけ)
 ・専用のアイコン付き。タスクバーでも他のpywとは別のアイコンとして並ぶ
 ・標準ライブラリのみで動作 (Python 3.8 以降 / Windows 想定)
 ・記録データはこのファイルと同じフォルダの disk_daicho.db (SQLite) に保存
@@ -29,11 +30,12 @@ import time
 import tkinter as tk
 import urllib.request
 import webbrowser
+import zipfile
 from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "ディスク台帳"
-APP_VERSION = "2026.11.25.1"
+APP_VERSION = "2026.11.28.1"
 VIEWER_URL = "https://tatata17.github.io/Disk-Daicho/"   # 書き出したCSVをブラウザで見るページ
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/tatata17/Disk-Daicho/main/"
 UPDATE_INFO_FILE = "version.json"
@@ -66,6 +68,7 @@ TYPE_FILTERS = {
 VIDEO_EXTS = set(TYPE_FILTERS["動画"])
 SOURCE_NAME_EXTS = {".m2ts", ".rpls", ".mts", ".ts", ".m2t"}
 SIDECAR_MAX_BYTES = 1024 * 1024
+ZIP_MAX_ENTRIES = 20000   # zip 1個あたり、中身を記録する上限(極端に多いzipで台帳がふくらまないように)
 SKIP_ROOT_NAMES = {"$recycle.bin", "system volume information", "recycler"}
 
 
@@ -338,18 +341,19 @@ def find_recorded(conn, serial, sub):
 
 
 # ---------------------------------------------------------------- 記録の設定・接続中ディスク・差分
-def rec_summary(folders_only, depth_mode, depth, info_csv):
+def rec_summary(folders_only, depth_mode, depth, info_csv, read_zip=True):
     """詳細設定の要約(畳んでいても見せる文)と、初期値どおりかどうかを返す"""
     parts = ["フォルダのみ" if folders_only else "フォルダ＋ファイル",
              f"{depth}階層まで" if depth_mode else "全階層",
-             "csv読取ON" if info_csv else "csv読取OFF"]
-    return " / ".join(parts), (not folders_only and not depth_mode and bool(info_csv))
+             "csv読取ON" if info_csv else "csv読取OFF",
+             "zip読取ON" if read_zip else "zip読取OFF"]
+    return " / ".join(parts), (not folders_only and not depth_mode and bool(info_csv) and bool(read_zip))
 
 
 def load_rec_options(conn):
     """settings に保存した詳細設定を読む。無い・壊れている値は初期値にする"""
     got = dict(conn.execute("SELECT key,value FROM settings WHERE key IN "
-                            "('rec_scope','rec_depth_mode','rec_depth','rec_info_csv')"))
+                            "('rec_scope','rec_depth_mode','rec_depth','rec_info_csv','rec_zip')"))
     try:
         depth = max(1, min(99, int(got.get("rec_depth", "2"))))
     except (TypeError, ValueError):
@@ -357,7 +361,8 @@ def load_rec_options(conn):
     return {"folders_only": got.get("rec_scope") == "1",
             "depth_mode": got.get("rec_depth_mode") == "1",
             "depth": depth,
-            "info_csv": got.get("rec_info_csv", "1") != "0"}
+            "info_csv": got.get("rec_info_csv", "1") != "0",
+            "read_zip": got.get("rec_zip", "1") != "0"}
 
 
 def save_rec_options(conn, opts):
@@ -366,7 +371,8 @@ def save_rec_options(conn, opts):
             ("rec_scope", "1" if opts["folders_only"] else "0"),
             ("rec_depth_mode", "1" if opts["depth_mode"] else "0"),
             ("rec_depth", str(int(opts["depth"]))),
-            ("rec_info_csv", "1" if opts["info_csv"] else "0")])
+            ("rec_info_csv", "1" if opts["info_csv"] else "0"),
+            ("rec_zip", "1" if opts.get("read_zip", True) else "0")])
 
 
 def disk_info_csv(conn, disk_id):
@@ -379,6 +385,13 @@ def disk_info_csv(conn, disk_id):
     if r:
         return r[0] != "0"
     return True
+
+
+def disk_read_zip(conn, disk_id):
+    """そのディスクを前回記録したとき、zipの中身を読み取ったかどうか(ワンクリック更新で引き継ぐ値)。
+    記録のたびに settings の zip_<ディスクid> に残している。残っていない旧記録は、既定(読み取る)にする"""
+    r = conn.execute("SELECT value FROM settings WHERE key=?", (f"zip_{disk_id}",)).fetchone()
+    return r[0] != "0" if r else True
 
 
 def info_csv_source(conn, disk_id):
@@ -424,6 +437,8 @@ def entry_paths(cur, disk_id, dirs_only=False):
     for eid, pid, name, is_dir, size in cur.execute(
             "SELECT id,parent_id,name,is_dir,size FROM entries WHERE disk_id=? ORDER BY id",
             (disk_id,)):
+        if pid not in dirs:
+            continue  # 親がフォルダでない = zip の中身。差分には数えない(zip 自体は1ファイルとして数える)
         base = dirs.get(pid, "")
         path = f"{base}\\{name}" if base else name
         if is_dir:
@@ -527,8 +542,7 @@ def export_rows(conn, disk_id, disk_name, hide=True, stats=None):
          channel, detail, note) in conn.execute(f"{SELECT_ROWS} WHERE e.disk_id=? ORDER BY e.id",
                                                 (disk_id,)):
         if eid in hidden or pid in gone:
-            if is_dir:
-                gone.add(eid)
+            gone.add(eid)   # フォルダも zip も、中身ごと除く
             skipped += 1
             continue
         base = paths.get(pid, "")
@@ -536,11 +550,82 @@ def export_rows(conn, disk_id, disk_name, hide=True, stats=None):
         if is_dir:
             paths[eid] = path
             size = max(0, (size or 0) - minus.get(eid, 0))
+        elif ext == "zip":
+            paths[eid] = path   # zip の中身は「…\\○○.zip\\中のパス」として出す
         yield [disk_name, path, "フォルダ" if is_dir else "ファイル", ext, size, fmt_size(size),
                fmt_time(mtime), title or "", bdate or "", btime or "", channel or "",
                detail or "", note or ""]
     if stats is not None:
         stats["skipped"] = stats.get("skipped", 0) + skipped
+
+
+# ---------------------------------------------------------------- zip の中身
+def _zip_time(date_time):
+    try:
+        return time.mktime(tuple(date_time) + (0, 0, -1))
+    except (OverflowError, ValueError, TypeError):
+        return None
+
+
+def zip_listing(path, limit=ZIP_MAX_ENTRIES):
+    """
+    zip の中身の一覧を返す: [((フォルダ, …, 名前), フォルダか, サイズ, 更新日時)]。親が必ず子より先に並ぶ。
+    展開はせず、zip の末尾にある一覧だけを読む(読み取り専用で開く。zip には何も書き込まない)。
+    サイズは展開後の大きさ。フォルダのサイズは、中のファイルの合計。読めない zip は None。
+    """
+    try:
+        with zipfile.ZipFile(path) as z:
+            infos = z.infolist()
+    except (zipfile.BadZipFile, OSError, ValueError, NotImplementedError, RuntimeError, EOFError,
+            MemoryError):
+        return None
+    out = {}
+
+    def need_dir(parts):
+        d = out.get(parts)
+        if d is None or not d[0]:
+            d = out[parts] = [True, 0, None]
+        return d
+
+    for zi in infos[:limit]:
+        # orig_filename を使う: filename のほうは、Windowsでは「\」が「/」に置き換えられてしまい、
+        # 「表」「ソ」など(Shift_JISの2バイト目が「\」と同じ文字)が壊れる
+        name = zi.orig_filename
+        if not zi.flag_bits & 0x800:  # UTF-8の印が無い。古いWindowsで作った日本語のzipは Shift_JIS
+            try:
+                name = name.encode("cp437").decode("cp932")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+        name = name.split("\0")[0].replace("\\", "/")
+        parts = tuple(x for x in name.split("/") if x and x not in (".", ".."))
+        if not parts:
+            continue
+        for i in range(1, len(parts)):   # 途中のフォルダが一覧に無いzipもあるので補う
+            need_dir(parts[:i])
+        if name.endswith("/"):
+            need_dir(parts)[2] = _zip_time(zi.date_time)
+        elif not (parts in out and out[parts][0]):
+            out[parts] = [False, zi.file_size, _zip_time(zi.date_time)]
+    for parts, (is_dir, size, _mt) in list(out.items()):
+        if not is_dir:
+            for i in range(1, len(parts)):
+                out[parts[:i]][1] += size
+    return [(parts, v[0], v[1], v[2]) for parts, v in sorted(out.items(), key=lambda kv: (len(kv[0]), kv[0]))]
+
+
+def zip_rows(path, disk_id, zip_id, next_id):
+    """zip の中身を、entries に入れる行にする。親は zip のファイルの行(zip_id)。(行のリスト, 次に使うid) を返す"""
+    listing = zip_listing(path)
+    if not listing:
+        return [], next_id
+    ids, rows = {}, []
+    for parts, is_dir, size, mt in listing:
+        ids[parts] = next_id
+        ext = "" if is_dir else os.path.splitext(parts[-1])[1][1:].lower()
+        rows.append((next_id, disk_id, ids.get(parts[:-1], zip_id), parts[-1], 1 if is_dir else 0,
+                     size, mt, ext))
+        next_id += 1
+    return rows, next_id
 
 
 def parse_sidecar_csv(path):
@@ -625,7 +710,8 @@ def connect():
     return conn
 
 
-def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_info=True):
+def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_info=True,
+              read_zip=True):
     """別スレッドで実行。ディスクを走査して1トランザクションで記録する。"""
     conn = connect()
     try:
@@ -646,7 +732,7 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
 
         dir_size = {0: 0}
         dir_parent = {}
-        n_files = n_dirs = n_skipped = n_info = 0
+        n_files = n_dirs = n_skipped = n_info = n_zip = 0
         diff = None
         lost_hidden = []   # 記録し直して、隠す設定の場所が見つからなくなったもの
         rows = []
@@ -694,14 +780,22 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
                             if not folders_only:
                                 stem, ext = os.path.splitext(e.name)
                                 ext = ext[1:].lower()
-                                rows.append((next_id, disk_id, pid, e.name, 0,
+                                fid = next_id
+                                next_id += 1
+                                rows.append((fid, disk_id, pid, e.name, 0,
                                              st.st_size, st.st_mtime, ext))
                                 if read_info:
                                     if ext == "csv" and st.st_size <= SIDECAR_MAX_BYTES:
-                                        csvs[stem.lower()] = (next_id, e.path)
+                                        csvs[stem.lower()] = (fid, e.path)
                                     elif ext in VIDEO_EXTS:
-                                        videos.append((next_id, stem.lower()))
-                                next_id += 1
+                                        videos.append((fid, stem.lower()))
+                                if (read_zip and ext == "zip"
+                                        and (max_depth is None or depth < max_depth)):
+                                    # zip の中身。zip の行を親にして載せる(サイズや件数の合計には入れない)
+                                    inner, next_id = zip_rows(e.path, disk_id, fid, next_id)
+                                    if inner:
+                                        rows.extend(inner)
+                                        n_zip += 1
                     except OSError:
                         n_skipped += 1
             if csvs:  # 動画と同名のcsvがあれば番組情報として読む
@@ -758,12 +852,15 @@ def scan_disk(root, name, folders_only, max_depth, replace_id, cancel, q, read_i
             cur.execute("DELETE FROM entries WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM programs WHERE disk_id=?", (replace_id,))
             cur.execute("DELETE FROM disks WHERE id=?", (replace_id,))
-            cur.execute("DELETE FROM settings WHERE key=?", (f"info_csv_{replace_id}",))
+            cur.execute("DELETE FROM settings WHERE key IN (?,?)",
+                        (f"info_csv_{replace_id}", f"zip_{replace_id}"))
         # 番組情報csvを読み取ったかどうかを、このディスクの値として残す(ワンクリック更新で引き継ぐ)
         cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
                     (f"info_csv_{disk_id}", "1" if read_info else "0"))
+        cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                    (f"zip_{disk_id}", "1" if read_zip else "0"))
         conn.commit()
-        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info, diff, lost_hidden))
+        q.put(("done", disk_id, n_files, n_dirs, n_skipped, n_info, diff, lost_hidden, n_zip))
     except Exception as ex:  # noqa: BLE001
         conn.rollback()
         q.put(("error", f"{type(ex).__name__}: {ex}"))
@@ -942,6 +1039,9 @@ TOOLTIP_TEXTS = {
     "動画と同名のcsv(m2ts-encoderの番組情報)を読み取る":
         "動画と同じ名前のcsvがあれば、番組名・放送日・チャンネル・番組内容を読み取って、動画と一緒に記録します。"
         "読み取ったcsvは一覧には出しません(ディスク上のcsvはそのままです)。",
+    "zipの中身も記録する":
+        "zip ファイルの中に入っているファイルの名前も記録して、検索できるようにします。"
+        "展開はせず、一覧を読むだけです(zip には何も書き込みません)。zip はフォルダのように開いて中を見られます。",
     "保存 ▾": "CSVへの書き出し、ビューアのサイトを開く、記録データのバックアップ。",
     "↑ 上へ": "選んでいるディスクを、一覧の中で1つ上へ動かします。",
     "↓ 下へ": "選んでいるディスクを、一覧の中で1つ下へ動かします。",
@@ -1059,6 +1159,8 @@ class App(tk.Tk):
         self.path_cache = {}
         self._hidden_ids = set()
         self._hidden_walk = {}
+        self._openable = set()
+        self._zip_walk = {}
         self._build()
         self._attach_tooltips()
         self.reload_drives()
@@ -1324,6 +1426,9 @@ class App(tk.Tk):
         self.var_info_csv = tk.BooleanVar(value=opts["info_csv"])
         ttk.Checkbutton(self.adv, text="動画と同名のcsv(m2ts-encoderの番組情報)を読み取る",
                         variable=self.var_info_csv, command=self._rec_changed).pack(side="left")
+        self.var_zip = tk.BooleanVar(value=opts["read_zip"])
+        ttk.Checkbutton(self.adv, text="zipの中身も記録する", variable=self.var_zip,
+                        command=self._rec_changed).pack(side="left", padx=(12, 0))
         self.var_depth.trace_add("write", self._rec_changed)
         self._rec_loading = False
         self._update_rec_summary()
@@ -1444,11 +1549,13 @@ class App(tk.Tk):
             depth = 2
         return {"folders_only": self.cmb_scope.current() == 1,
                 "depth_mode": self.cmb_depth.current() == 1,
-                "depth": depth, "info_csv": bool(self.var_info_csv.get())}
+                "depth": depth, "info_csv": bool(self.var_info_csv.get()),
+                "read_zip": bool(self.var_zip.get())}
 
     def _update_rec_summary(self):
         o = self._rec_options()
-        text, is_default = rec_summary(o["folders_only"], o["depth_mode"], o["depth"], o["info_csv"])
+        text, is_default = rec_summary(o["folders_only"], o["depth_mode"], o["depth"], o["info_csv"],
+                                       o["read_zip"])
         mark = "▾" if self.adv_open else "▸"
         self.lbl_adv.configure(
             text=f"{mark} 詳細設定:  {text}" + ("" if is_default else "   ← 初期値と違う設定です"),
@@ -1547,9 +1654,10 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"{path} を開けません。\nディスクが外されていないか確認してください。")
             self.reload_drives()
             return
-        self._begin_scan(path, r[0], bool(r[1]), r[2], disk_id, disk_info_csv(self.conn, disk_id))
+        self._begin_scan(path, r[0], bool(r[1]), r[2], disk_id, disk_info_csv(self.conn, disk_id),
+                         disk_read_zip(self.conn, disk_id))
 
-    def _begin_scan(self, root, name, folders_only, max_depth, replace_id, read_info):
+    def _begin_scan(self, root, name, folders_only, max_depth, replace_id, read_info, read_zip=True):
         self.cancel.clear()
         self.scanning = True
         self._scan_name = name
@@ -1559,7 +1667,8 @@ class App(tk.Tk):
             b.configure(state="disabled")
         self.var_status.set(f"「{name}」の記録を開始します…")
         threading.Thread(target=scan_disk, daemon=True, args=(
-            root, name, folders_only, max_depth, replace_id, self.cancel, self.q, read_info)).start()
+            root, name, folders_only, max_depth, replace_id, self.cancel, self.q, read_info,
+            read_zip)).start()
 
     # ---------------- ドライブ選択・記録
     def reload_drives(self):
@@ -1634,8 +1743,8 @@ class App(tk.Tk):
             o = self._rec_options()
             now_depth = o["depth"] if o["depth_mode"] else None
             if prev and (bool(prev[0]) != o["folders_only"] or prev[1] != now_depth):
-                was = rec_summary(bool(prev[0]), prev[1] is not None, prev[1], True)[0].rsplit(" / ", 1)[0]
-                now = rec_summary(o["folders_only"], o["depth_mode"], o["depth"], True)[0].rsplit(" / ", 1)[0]
+                was = rec_summary(bool(prev[0]), prev[1] is not None, prev[1], True)[0].rsplit(" / ", 2)[0]
+                now = rec_summary(o["folders_only"], o["depth_mode"], o["depth"], True)[0].rsplit(" / ", 2)[0]
                 msg += f"\n\n※記録範囲が前回と違います。\n　前回: {was}\n　今回: {now}"
             ans = messagebox.askyesnocancel(APP_NAME, msg)
             if ans is None:
@@ -1664,7 +1773,7 @@ class App(tk.Tk):
                 replace_id = row[0]
         o = self._rec_options()
         self._begin_scan(root, name, o["folders_only"], o["depth"] if o["depth_mode"] else None,
-                         replace_id, o["info_csv"])
+                         replace_id, o["info_csv"], o["read_zip"])
 
     def _poll(self):
         try:
@@ -1679,6 +1788,8 @@ class App(tk.Tk):
                 if msg[0] == "done":
                     skipped = f" (読めなかった場所 {msg[4]:,} 件)" if msg[4] else ""
                     info = f" / 番組情報 {msg[5]:,} 件" if msg[5] else ""
+                    if msg[8]:
+                        info += f" / 中身を読んだzip {msg[8]:,} 個"
                     text = f"記録しました。ファイル {msg[2]:,} / フォルダ {msg[3]:,}{info}{skipped}"
                     diff = msg[6]
                     if diff:
@@ -1809,7 +1920,8 @@ class App(tk.Tk):
             self.conn.execute("DELETE FROM programs WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM notes WHERE disk_id=?", (self.cur_disk,))
             self.conn.execute("DELETE FROM hidden WHERE disk_id=?", (self.cur_disk,))
-            self.conn.execute("DELETE FROM settings WHERE key=?", (f"info_csv_{self.cur_disk}",))
+            self.conn.execute("DELETE FROM settings WHERE key IN (?,?)",
+                              (f"info_csv_{self.cur_disk}", f"zip_{self.cur_disk}"))
             self.conn.execute("DELETE FROM disks WHERE id=?", (self.cur_disk,))
         self.path_cache.clear()
         self.cur_disk = None
@@ -1867,6 +1979,14 @@ class App(tk.Tk):
         rows = rows[:PAGE_SIZE]
         names = {}
         has_info = False
+        # 中身を記録してある zip(フォルダのように開ける)
+        zips = [r[0] for r in rows if not r[4] and r[7] == "zip"]
+        self._openable = set()
+        if zips:
+            marks = ",".join("?" * len(zips))
+            self._openable = {r[0] for r in self.conn.execute(
+                f"SELECT DISTINCT parent_id FROM entries WHERE parent_id IN ({marks})", zips)}
+        self._zip_walk = {}
         for (eid, disk_id, pid, name, is_dir, size, mtime, ext,
              title, bdate, btime, channel, detail, note) in rows:
             loc = ""
@@ -1878,6 +1998,8 @@ class App(tk.Tk):
                 loc = f"{names[disk_id]}\\{self.path_of(pid)}"
             self.tree.insert("", "end", iid=str(eid), text=("■ " if is_dir else "　 ") + name
                              + ("　［番組情報あり］" if title is not None else "")
+                             + ("　［zip:中を見られます］" if eid in self._openable else "")
+                             + ("　［zipの中］" if show_loc and self._in_zip(pid) else "")
                              + ("　［CSVで隠す］" if eid in self._hidden_ids
                                 else "　［CSVで隠す:上のフォルダごと］" if self._under_hidden(pid) else ""),
                              values=((note or "").replace("\n", " "), fmt_size(size), fmt_time(mtime),
@@ -1964,6 +2086,25 @@ class App(tk.Tk):
         self.txt_detail.configure(state="disabled")
 
     # ---------------- CSVで隠す設定
+    def _in_zip(self, parent_id):
+        """parent_id の下にあるものが、zip の中身かどうか(親をたどって、フォルダでないもの = zip があれば中身)"""
+        chain, x, found = [], parent_id, False
+        while x:
+            if x in self._zip_walk:
+                found = self._zip_walk[x]
+                break
+            chain.append(x)
+            r = self.conn.execute("SELECT parent_id,is_dir FROM entries WHERE id=?", (x,)).fetchone()
+            if not r:
+                break
+            if not r[1]:
+                found = True
+                break
+            x = r[0]
+        for c in chain:
+            self._zip_walk[c] = found
+        return found
+
     def _under_hidden(self, folder_id):
         """folder_id のフォルダ自身か、その上のどれかが「CSVで隠す」になっているか"""
         if not self._hidden_ids:
@@ -2091,8 +2232,8 @@ class App(tk.Tk):
             return
         eid = int(sel[0])
         disk_id, pid, _name, is_dir = self.row_info[eid]
-        if is_dir:
-            self.goto(disk_id, eid)
+        if is_dir or (eid in self._openable and not self.search_mode):
+            self.goto(disk_id, eid)   # フォルダ、または中身を記録してある zip を開く
         elif self.search_mode:
             self.goto(disk_id, pid)
             self._select_row(eid, True)

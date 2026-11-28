@@ -200,16 +200,20 @@ function getDisk(model, name) {
   return d;
 }
 
+/* parent の下にあるものが zip の中身かどうか(parent が zip 自身か、zip の中のフォルダ) */
+function inZip(parent) { return !!parent && (parent.z || (!parent.d && !!parent.p)); }
+
 function getDir(disk, path) {
   let node = disk.dirs.get(path);
   if (node) return node;
   const k = path.lastIndexOf("\\");
   const parent = getDir(disk, k < 0 ? "" : path.slice(0, k));
-  node = { n: k < 0 ? path : path.slice(k + 1), p: parent, d: true, c: [], s: 0, m: "", e: "", pi: null, disk };
+  node = { n: k < 0 ? path : path.slice(k + 1), p: parent, d: true, c: [], s: 0, m: "", e: "", pi: null, disk,
+           z: inZip(parent) };
   parent.c.push(node);
   disk.dirs.set(path, node);
   disk.all.push(node);
-  disk.folders++;
+  if (!node.z) disk.folders++;   // zip の中のフォルダは、件数に入れない
   return node;
 }
 
@@ -246,9 +250,14 @@ function addRows(model, rows) {
                      pi: title || get(r, cCh) || get(r, cDetail)
                        ? { title, bdate: get(r, cBdate), btime: get(r, cBtime), ch: get(r, cCh), detail: get(r, cDetail) }
                        : null };
+      node.z = inZip(parent);
       parent.c.push(node);
       disk.all.push(node);
-      disk.files++;
+      if (!node.z) disk.files++;   // zip の中のファイルは、件数に入れない(zip 自体を1ファイルと数える)
+      if (node.e === "zip" && !node.z) {   // 中身の行がこのあと続くので、入れ物として登録しておく
+        node.c = [];
+        disk.dirs.set(path, node);
+      }
     }
     count++;
   }
@@ -445,11 +454,14 @@ if (typeof document !== "undefined") (function () {
   }
 
   function rowOf(x) {
-    const row = el("div", "item" + (x.d ? " dir click" : x.pi ? " click" : ""));
+    const openZip = !x.d && x.c && x.c.length > 0;   // 中身が記録されている zip。フォルダのように開ける
+    const row = el("div", "item" + (x.d ? " dir click" : (x.pi || openZip) ? " click" : ""));
     row.append(el("div", "ico", x.d ? "■" : "・"));
     const body = el("div", "body");
     const name = el("div", "name", x.n);
     if (x.pi) name.append(" ", el("span", "chip has", "番組情報あり"));
+    if (openZip) name.append(" ", el("span", "chip has", "zip:中を見られます"));
+    if (results && x.z) name.append(" ", el("span", "chip", "zipの中"));
     body.append(name);
     if (x.note) body.append(el("div", "memo", "メモ: " + x.note));
     const meta = el("div", "meta");
@@ -469,7 +481,8 @@ if (typeof document !== "undefined") (function () {
       body.append(loc);
     }
     row.append(body);
-    if (x.d) row.onclick = () => goto(x);
+    if (x.d || (openZip && !results)) row.onclick = () => goto(x);
+    else if (openZip) row.onclick = () => goto(x);
     else if (x.pi) row.onclick = () => {
       const old = body.querySelector(".detail");
       if (old) { old.remove(); return; }
